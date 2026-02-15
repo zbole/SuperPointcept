@@ -15,6 +15,9 @@ from .aeo import AEODataset
 from .semantic_kitti import SemanticKITTIDataset
 from .nuscenes import NuScenesDataset
 from .waymo import WaymoDataset
+# outdoor scene but not original
+from .STPLS3D import STPLS3DDataset
+from .TransmissionCorridor import TransmissionCorridorDataset
 
 # object
 from .modelnet import ModelNetDataset

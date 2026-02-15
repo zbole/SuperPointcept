@@ -14,3 +14,15 @@ outputs/
 */.DS_Store
 **/*.out
 Dockerfile
+
+# Ignore large training artifacts
+*.pth
+*.ckpt
+*.h5
+runs/
+wandb/
+log/
+
+# Ignore datasets
+data/
+dataset/

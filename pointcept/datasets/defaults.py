@@ -111,6 +111,14 @@ class DefaultDataset(Dataset):
             return shared_dict(cache_name)
 
         data_dict = {}
+        # [Patch by Bole] Handle .pth files directly
+        if isinstance(data_path, str) and data_path.endswith(".pth"):
+            data = torch.load(data_path, weights_only=False)
+            if "color" in data: data["color"] = data["color"].astype(np.float32)
+            if "segment" in data: data["segment"] = data["segment"].reshape(-1)
+            if "instance" in data: data["instance"] = data["instance"].reshape(-1)
+            return data
+        # [End Patch]
         assets = os.listdir(data_path)
         for asset in assets:
             if not asset.endswith(".npy"):
