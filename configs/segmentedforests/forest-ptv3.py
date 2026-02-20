@@ -1,20 +1,20 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 2  # 显存够的话可以开大
+batch_size = 1  # 2 可以完成训练，但是test会报错，暂时改为1
 num_worker = 4
 mix_prob = 0.8
 empty_cache = True
-enable_amp = False # 建议开启 AMP 加速
+enable_amp = False # ✅ 保持关闭，防止梯度爆炸
 
 # model settings
 model = dict(
     type="DefaultSegmentorV2",
-    num_classes=13, # ✅ 修正为 13 类
+    num_classes=4,
     backbone_out_channels=64,
     backbone=dict(
         type="PT-v3m1",
-        in_channels=6, # coord(3) + color(3)
+        in_channels=6,
         order=("z", "z-trans", "hilbert", "hilbert-trans"),
         stride=(2, 2, 2, 2),
         enc_depths=(2, 2, 2, 6, 2),
@@ -42,7 +42,7 @@ model = dict(
         pdnorm_decouple=True,
         pdnorm_adaptive=False,
         pdnorm_affine=True,
-        pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D", "SensatUrban"), # ✅ 加上 SensatUrban
+        pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D", "SensatUrban"),
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=255),
@@ -52,7 +52,7 @@ model = dict(
 
 # scheduler settings
 epoch = 100
-optimizer = dict(type="AdamW", lr=0.005, weight_decay=0.05) # SensatUrban 学习率稍微调大一点点
+optimizer = dict(type="AdamW", lr=0.005, weight_decay=0.05)
 scheduler = dict(
     type="OneCycleLR",
     max_lr=[0.006, 0.0006],
@@ -64,20 +64,17 @@ scheduler = dict(
 param_dicts = [dict(keyword="block", lr=0.0006)]
 
 # dataset settings
-dataset_type = "DefaultDataset" # ✅ 修正 Dataset 类型
-# ✅ 修正为 Docker 内部对应的绝对路径
-data_root = "/data/datasets/OpenDataLab___SensatUrban/raw/SensatUrban/SensatUrban_Dataset/ply/processed"
+dataset_type = "DefaultDataset"
+data_root = "data/segmentedforests/processed" # ✅ 修正路径
 
 data = dict(
-    num_classes=13,
+    num_classes=4, # ✅ 4类
     ignore_index=255,
-    # ✅ SensatUrban 13类名称
-    names=["Ground", "Vegetation", "Building", "Wall", "Bridge", "Parking", 
-           "Rail", "TrafficRoad", "StreetFurniture", "Car", "Footpath", "Bike", "Water"],
+    names=["Ground", "LowVeg", "Stem", "Foliage"], # ✅ 4类名称
     train=dict(
         type=dataset_type,
         split="train",
-        data_root=data_root , # 确保指向 train 子文件夹
+        data_root=data_root,
         transform=[
             dict(type="CenterShift", apply_z=True),
             dict(
@@ -96,14 +93,13 @@ data = dict(
             dict(type="ChromaticJitter", p=0.95, std=0.05),
             dict(
                 type="GridSample",
-                grid_size=0.1, 
+                grid_size=0.1, # ✅ 森林建议更精细 (5cm)
                 hash_type="fnv",
                 mode="train",
                 return_grid_coord=True,
             ),
-            # SensatUrban 点数很多，加上 SphereCrop 防止爆显存
             dict(type="SphereCrop", sample_rate=0.8, mode="random"),
-            dict(type="SphereCrop", point_max=200000, mode="random"), 
+            dict(type="SphereCrop", point_max=200000, mode="random"),
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
             dict(type="ToTensor"),
@@ -121,6 +117,7 @@ data = dict(
         data_root=data_root,
         transform=[
             dict(type="CenterShift", apply_z=True),
+            # ✅ 关键：保留原始标签，防止验证报错
             dict(type="Copy", keys_dict={"segment": "origin_segment"}),
             dict(
                 type="GridSample",

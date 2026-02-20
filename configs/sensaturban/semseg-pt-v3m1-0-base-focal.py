@@ -1,20 +1,20 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 4  # 根据显存调整
-num_worker = 8
+batch_size = 2  # 显存够的话可以开大
+num_worker = 4
 mix_prob = 0.8
 empty_cache = True
-enable_amp = False
+enable_amp = False # 建议开启 AMP 加速
 
 # model settings
 model = dict(
     type="DefaultSegmentorV2",
-    num_classes=13,
+    num_classes=13, # ✅ 修正为 13 类
     backbone_out_channels=64,
     backbone=dict(
         type="PT-v3m1",
-        in_channels=6,
+        in_channels=6, # coord(3) + color(3)
         order=("z", "z-trans", "hilbert", "hilbert-trans"),
         stride=(2, 2, 2, 2),
         enc_depths=(2, 2, 2, 6, 2),
@@ -42,21 +42,21 @@ model = dict(
         pdnorm_decouple=True,
         pdnorm_adaptive=False,
         pdnorm_affine=True,
-        pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D", "STPLS3D"),
+        pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D", "SensatUrban"), # ✅ 加上 SensatUrban
     ),
     criteria=[
-        # 🚨 ignore_index 必须改为 255，匹配预处理脚本的填充值
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=255),
+        dict(type="FocalLoss", gamma=2.0, loss_weight=1.0, ignore_index=255),
         dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=255),
     ],
 )
 
 # scheduler settings
 epoch = 100
-optimizer = dict(type="AdamW", lr=0.003, weight_decay=0.05)
+optimizer = dict(type="AdamW", lr=0.005, weight_decay=0.05) # SensatUrban 学习率稍微调大一点点
 scheduler = dict(
     type="OneCycleLR",
-    max_lr=[0.003, 0.0003],
+    max_lr=[0.006, 0.0006],
     pct_start=0.05,
     anneal_strategy="cos",
     div_factor=10.0,
@@ -65,18 +65,20 @@ scheduler = dict(
 param_dicts = [dict(keyword="block", lr=0.0006)]
 
 # dataset settings
-dataset_type = "STPLS3DDataset"
-data_root = "data/OpenDataLab___SensatUrban/data/processed" # ✅ 修正数据路径
+dataset_type = "DefaultDataset" # ✅ 修正 Dataset 类型
+# ✅ 修正为 Docker 内部对应的绝对路径
+data_root = "/data/datasets/OpenDataLab___SensatUrban/raw/SensatUrban/SensatUrban_Dataset/ply/processed"
 
 data = dict(
     num_classes=13,
     ignore_index=255,
+    # ✅ SensatUrban 13类名称
     names=["Ground", "Vegetation", "Building", "Wall", "Bridge", "Parking", 
            "Rail", "TrafficRoad", "StreetFurniture", "Car", "Footpath", "Bike", "Water"],
     train=dict(
         type=dataset_type,
-        split="train", # 注意：如果你的预处理文件夹里没分train/val，这里可能需要调整，或者 Pointcept 会自动搜所有文件
-        data_root=data_root,
+        split="train",
+        data_root=data_root , # 确保指向 train 子文件夹
         transform=[
             dict(type="CenterShift", apply_z=True),
             dict(
@@ -84,23 +86,25 @@ data = dict(
                 dropout_ratio=0.2,
                 dropout_application_ratio=0.2
             ),
-            dict(type="RandomRotate", angle=[-1, 1], axis="z", center=[0, 0, 0], p=0.75),
+            dict(type="RandomRotate", angle=[-1, 1], axis="z", center=[0, 0, 0], p=0.5),
             dict(type="RandomRotate", angle=[-1 / 64, 1 / 64], axis="x", p=0.5),
             dict(type="RandomRotate", angle=[-1 / 64, 1 / 64], axis="y", p=0.5),
-            dict(type="RandomScale", scale=[0.95, 1.05]),
+            dict(type="RandomScale", scale=[0.9, 1.1]),
+            dict(type="RandomFlip", p=0.5),
             dict(type="RandomJitter", sigma=0.005, clip=0.02),
             dict(type="ChromaticAutoContrast", p=0.2, blend_factor=None),
             dict(type="ChromaticTranslation", p=0.95, ratio=0.05),
             dict(type="ChromaticJitter", p=0.95, std=0.05),
             dict(
                 type="GridSample",
-                grid_size=0.1,  # 训练时通常保持和预处理一致或稍大
+                grid_size=0.1, 
                 hash_type="fnv",
                 mode="train",
                 return_grid_coord=True,
             ),
+            # SensatUrban 点数很多，加上 SphereCrop 防止爆显存
             dict(type="SphereCrop", sample_rate=0.8, mode="random"),
-            dict(type="SphereCrop", point_max=150000, mode="random"),
+            dict(type="SphereCrop", point_max=200000, mode="random"), 
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
             dict(type="ToTensor"),
@@ -121,7 +125,7 @@ data = dict(
             dict(type="Copy", keys_dict={"segment": "origin_segment"}),
             dict(
                 type="GridSample",
-                grid_size=0.1, # 验证集保持 0.1
+                grid_size=0.1,
                 hash_type="fnv",
                 mode="train",
                 return_grid_coord=True,
@@ -132,19 +136,16 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=("coord", "grid_coord", "segment", "origin_segment", "inverse"),
+                keys=('coord', 'grid_coord', 'segment', 'inverse', 'origin_segment'),
                 feat_keys=("coord", "color"),
             ),
         ],
         test_mode=False,
     ),
     test=dict(
-        dict(
-                type="CategoryMapping",
-            ),
         type=dataset_type,
         split="val",
-        data_root=data_root + "",
+        data_root=data_root,
         transform=[
             dict(type="CenterShift", apply_z=True),
             dict(type="NormalizeColor"),

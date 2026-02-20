@@ -1,0 +1,68 @@
+0.安装conda环境
+
+
+
+1. 拉取支持 5090 的官方镜像  权限拦路虎！🐯
+我们需要 25.01 或更新的版本（通常 1 月发布的镜像开始支持 5090）。
+# 拉取 NVIDIA PyTorch 镜像 (内含 CUDA 12.8+, PyTorch 2.5+, 且针对 Blackwell 优化)
+sudo docker pull nvcr.io/nvidia/pytorch:25.01-py3
+
+
+2. 启动容器 (挂载你的代码目录)
+假设你在 ~/blz 目录下：
+
+Bash
+# --gpus all: 启用显卡
+# --ipc=host: 防止多卡训练时内存不足 (Pointcept 必须)
+# -v: 将当前目录挂载到容器内的 /workspace
+docker run --gpus all -it --rm --ipc=host -v $(pwd):/workspace nvcr.io/nvidia/pytorch:25.01-py3
+
+3. 容器内验证 (The Final Check)
+进入容器后，再次运行那个 Python 测试。如果这次还没过，那就是 NVIDIA 驱动层面的问题了（但概率极小）。
+
+# 启动容器并挂载当前目录
+sudo docker run --gpus all -it --rm --ipc=host -v $(pwd):/workspace nvcr.io/nvidia/pytorch:25.01-py3
+# 进入容器后，直接运行 Python 验证
+python -c "import torch; print(f'CUDA: {torch.version.cuda}'); print(f'Device: {torch.cuda.get_device_name(0)}'); a = torch.randn(1000).cuda(); print('Success! 5090 is READY.')"
+
+exit 退出 sudo docker exec -it bole_lab bash 进入
+
+# 退出当前容器
+exit
+
+# 重新启动（注意多了第二行 -v）
+sudo docker run --gpus all -it \
+  --name bole_lab_final \
+  --shm-size=32g \
+  -v /home/bolezhang/blz/Pointcept:/workspace/Pointcept \
+  -v /data/datasets:/data/datasets \
+  ptv3_gpu_image /bin/bash
+
+sudo docker start -ai bole_lab_final
+
+sudo docker exec -it bole_lab_final bash
+
+sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n SensatUrban-PTV3-Base -w exp/sensaturban/SensatUrban-PTV3-Base/model/model_best.pth
+
+4.安装包
+
+pip install spconv-cu120 等等
+
+5.检查：
+
+python -c 'import pointops; print("PointOps is ready")'
+
+python -c "import torch; print(f'Torch: {torch.__version__}, CUDA: {torch.version.cuda}')"
+
+
+训练：
+
+export CUDA_LAUNCH_BLOCKING=1
+
+sh scripts/train.sh -g 1 -d stpls3d -c semseg-pt-v3m1-0-base -n exp_stpls3d_5090 -w model_best
+sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n SensatUrban-PTV3-Base -w model_best
+
+新的训练脚本：
+
+sh scripts/train.sh -g 1 -d stpls3d -c semseg-pt-v3m1-0-base-6cls-focal -n exp_stpls3d_5090_6cls_focal
+sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base-focal -n exp_sensaturban_5090_focal
