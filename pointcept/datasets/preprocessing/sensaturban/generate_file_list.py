@@ -2,12 +2,13 @@ import os
 from pathlib import Path
 
 # 🚨 你的数据根目录
-DATA_ROOT = Path("../../../../data/OpenDataLab__SensatUrban/data/processed")
+DATA_ROOT = Path("../../../../../../data/datasets/OpenDataLab___SensatUrban/data/processed_10d")
 
 def generate_list(split):
     target_dir = DATA_ROOT / split
+    # 增加了一个 .resolve() 打印，这样万一找不到，你能立刻看到 Python 到底去哪找了
     if not target_dir.exists():
-        print(f"❌ {split} 目录不存在")
+        print(f"❌ {split} 目录不存在! Python 试图寻找的路径是: {target_dir.resolve()}")
         return
 
     # 1. 获取所有子文件夹的名字 (即样本名)

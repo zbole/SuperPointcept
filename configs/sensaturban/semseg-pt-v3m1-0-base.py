@@ -14,7 +14,7 @@ model = dict(
     backbone_out_channels=64,
     backbone=dict(
         type="PT-v3m1",
-        in_channels=6, # coord(3) + color(3)
+        in_channels=10, # coord(3) + color(3)+F1F2F3+num of points in local grid(1)
         order=("z", "z-trans", "hilbert", "hilbert-trans"),
         stride=(2, 2, 2, 2),
         enc_depths=(2, 2, 2, 6, 2),
@@ -66,7 +66,7 @@ param_dicts = [dict(keyword="block", lr=0.0006)]
 # dataset settings
 dataset_type = "DefaultDataset" # ✅ 修正 Dataset 类型
 # ✅ 修正为 Docker 内部对应的绝对路径
-data_root = "/data/datasets/OpenDataLab___SensatUrban/raw/SensatUrban/SensatUrban_Dataset/ply/processed"
+data_root = "/data/datasets/OpenDataLab___SensatUrban/data/processed_10d"
 
 data = dict(
     num_classes=13,
@@ -110,7 +110,7 @@ data = dict(
             dict(
                 type="Collect",
                 keys=("coord", "grid_coord", "segment"),
-                feat_keys=("coord", "color"),
+                feat_keys=("coord", "color", "extra_feat"),
             ),
         ],
         test_mode=False,
@@ -136,7 +136,7 @@ data = dict(
             dict(
                 type="Collect",
                 keys=('coord', 'grid_coord', 'segment', 'inverse', 'origin_segment'),
-                feat_keys=("coord", "color"),
+                feat_keys=("coord", "color", "extra_feat"),
             ),
         ],
         test_mode=False,
@@ -165,7 +165,7 @@ data = dict(
                 dict(
                     type="Collect",
                     keys=("coord", "grid_coord", "index"),
-                    feat_keys=("coord", "color"),
+                    feat_keys=("coord", "color", "extra_feat"),
                 ),
             ],
             aug_transform=[

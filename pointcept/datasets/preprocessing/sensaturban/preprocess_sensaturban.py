@@ -1,141 +1,133 @@
 import os
-import argparse
-import glob
 import numpy as np
-import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor
-from itertools import repeat
+import open3d as o3d
 from pathlib import Path
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor
+from itertools import repeat
+from plyfile import PlyData
 
-try:
-    from plyfile import PlyData
-except ImportError:
-    raise ImportError("Please install plyfile: pip install plyfile")
+# ========================================================
+# 硬编码参数设置 (Hardcoded Parameters)
+# ========================================================
+RAW_DATA_ROOT = Path("../../../../../../data/datasets/OpenDataLab___SensatUrban/raw/SensatUrban/SensatUrban_Dataset/ply")
+OUT_DATA_ROOT = Path("../../../../../../data/datasets/OpenDataLab___SensatUrban/data/processed_10d")
 
-def process_scene(scene_path, out_root, grid_size=0.1, chunk_size=(50, 50), chunk_stride=(25, 25)):
+GRID_SIZE = 0.1         # 下采样格点大小
+NUM_WORKERS = 2         # 进程并行数 (建议设为 CPU 核心数)
+KNN_K = 16              # 计算几何特征的近邻数
+CHUNK_SIZE = (50, 50)   # 切块大小 (meters)
+CHUNK_STRIDE = (25, 25) # 切块步长 (meters)
+
+# 验证集选取的 Block 名
+VAL_BLOCKS = ["birmingham_block_1", "birmingham_block_6", "cambridge_block_12", "cambridge_block_6"]
+
+# ========================================================
+# 核心计算模块
+# ========================================================
+
+def extract_geometric_features(points, k=16):
+    """使用 Open3D 高速提取几何特征值"""
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd_tree = o3d.geometry.KDTreeFlann(pcd)
+    
+    n_points = len(points)
+    eigenvalues = np.zeros((n_points, 3), dtype=np.float32)
+    
+    points_np = np.asarray(pcd.points)
+    for i in range(n_points):
+        # 1. KNN 搜索
+        [_, idx, _] = pcd_tree.search_knn_vector_3d(points_np[i], k)
+        neighbors = points_np[idx]
+        
+        if len(neighbors) >= 3:
+            # 2. 计算局部协方差并求特征值
+            cov = np.cov(neighbors.T)
+            vals, _ = np.linalg.eigh(cov) # 默认从小到大: lambda_1, lambda_2, lambda_3
+            
+            # 3. 归一化 (让特征值表示概率：线性、平面、散射)
+            sum_vals = np.sum(vals) + 1e-6
+            eigenvalues[i] = vals / sum_vals # 结果在 [0, 1] 之间
+            
+    return eigenvalues
+
+def process_scene(scene_path):
     scene_path = Path(scene_path)
     scene_name = scene_path.stem.lower()
     
-    # -------------------------------------------------------
-    # 1. 智能判断输出路径
-    # -------------------------------------------------------
-    # 如果源文件在 'train' 文件夹，输出到 'processed/train'
-    # 如果源文件在 'test' 文件夹，且是 Block 2/8 (验证集)，输出到 'processed/val'
-    parent_folder = scene_path.parent.name
-    
-    # 定义你选取的验证集 Block 名
-    val_block_names = ["birmingham_block_1", "birmingham_block_6", "cambridge_block_12", "cambridge_block_6"]
-
-    scene_name_lower = scene_path.stem.lower()
-
-    # 只要是在官方 train 文件夹下的，都可以读到标签
+    # 判断归属：train / val / test
+    parent_folder = scene_path.parent.name # 'train' 或 'test'
     if parent_folder == "train":
-        if any(bn in scene_name_lower for bn in val_block_names):
-            save_dir = out_root / "val"  # 真正有标签的验证集
-        else:
-            save_dir = out_root / "train" # 训练集
-    elif parent_folder == "test":
-        save_dir = out_root / "test"     # 纯推理用的测试集 (全 255)
+        save_dir = OUT_DATA_ROOT / ("val" if any(bn in scene_name for bn in VAL_BLOCKS) else "train")
+    else:
+        save_dir = OUT_DATA_ROOT / "test"
 
-    # -------------------------------------------------------
-    # 2. 读取 PLY
-    # -------------------------------------------------------
+    # 1. 读取 PLY 数据
     try:
         with open(str(scene_path), 'rb') as f:
             plydata = PlyData.read(f)
-        
         vertex = plydata['vertex']
         points = np.stack([vertex['x'], vertex['y'], vertex['z']], axis=1).astype(np.float32)
-        
-        if 'red' in vertex:
-            colors = np.stack([vertex['red'], vertex['green'], vertex['blue']], axis=1).astype(np.uint8)
-        else:
-            colors = np.zeros_like(points, dtype=np.uint8)
-        
-        # 标签处理
-        if 'class' in vertex:
-            labels = np.array(vertex['class']).astype(np.int16)
-        elif 'label' in vertex:
-            labels = np.array(vertex['label']).astype(np.int16)
-        else:
-            labels = np.full(points.shape[0], 255, dtype=np.int16)
-            
+        colors = np.stack([vertex['red'], vertex['green'], vertex['blue']], axis=1).astype(np.uint8) if 'red' in vertex else np.zeros_like(points, dtype=np.uint8)
+        labels = np.array(vertex['class' if 'class' in vertex else 'label']).astype(np.int16) if ('class' in vertex or 'label' in vertex) else np.full(points.shape[0], 255, dtype=np.int16)
     except Exception as e:
-        return f"❌ Error reading {scene_name}: {e}"
+        return f"❌ Error {scene_name}: {e}"
 
-    # -------------------------------------------------------
-    # 3. 坐标归一化 & Grid Sampling
-    # -------------------------------------------------------
-    points -= points.min(axis=0) # 归一化
+    # 2. 坐标平移 & Grid Sampling
+    points -= points.min(axis=0)
+    
+    # 提取 Grid Density (特征第 10 维)
+    scaled_coord = points / GRID_SIZE
+    grid_coord = np.floor(scaled_coord).astype(int)
+    _, indices, counts = np.unique(grid_coord, axis=0, return_index=True, return_counts=True)
+    
+    points = points[indices]
+    colors = colors[indices]
+    labels = labels[indices]
+    grid_density = counts.astype(np.float32).reshape(-1, 1) # 局部密度计数
 
-    if grid_size > 0:
-        scaled_coord = points / grid_size
-        grid_coord = np.floor(scaled_coord).astype(int)
-        _, indices = np.unique(grid_coord, axis=0, return_index=True)
-        points = points[indices]
-        colors = colors[indices]
-        labels = labels[indices]
+    # 3. 计算 3 维特征值 (特征第 7, 8, 9 维)
+    # 在下采样后的点上算，速度极快
+    eigen_feats = extract_geometric_features(points, k=KNN_K)
+    
+    # 拼接成 4 维额外特征 (Eigenvalues + Density)
+    extra_feat = np.concatenate([eigen_feats, grid_density], axis=1).astype(np.float32)
 
-    # -------------------------------------------------------
-    # 4. 切块
-    # -------------------------------------------------------
+    # 4. 切块保存 (Chunking)
     x_max, y_max = points.max(axis=0)[:2]
-    
     chunk_idx = 0
-    saved_count = 0
     
-    x_range = np.arange(0, x_max, chunk_stride[0])
-    y_range = np.arange(0, y_max, chunk_stride[1])
-
-    for x in x_range:
-        for y in y_range:
-            mask = (
-                (points[:, 0] >= x) & (points[:, 0] < x + chunk_size[0]) &
-                (points[:, 1] >= y) & (points[:, 1] < y + chunk_size[1])
-            )
+    for x in np.arange(0, x_max, CHUNK_STRIDE[0]):
+        for y in np.arange(0, y_max, CHUNK_STRIDE[1]):
+            mask = (points[:, 0] >= x) & (points[:, 0] < x + CHUNK_SIZE[0]) & \
+                   (points[:, 1] >= y) & (points[:, 1] < y + CHUNK_SIZE[1])
             
-            if np.sum(mask) < 1000:
-                continue
+            if np.sum(mask) < 1000: continue # 过滤点数太少的块
             
-            # 存到对应的 train 或 val 文件夹下
-            chunk_name = f"{scene_name}_{chunk_idx}"
-            chunk_path = save_dir / chunk_name
+            chunk_path = save_dir / f"{scene_name}_{chunk_idx}"
             chunk_path.mkdir(parents=True, exist_ok=True)
             
             np.save(chunk_path / "coord.npy", points[mask])
             np.save(chunk_path / "color.npy", colors[mask])
             np.save(chunk_path / "segment.npy", labels[mask])
+            np.save(chunk_path / "extra_feat.npy", extra_feat[mask]) # 关键：存储 4 维几何先验
             
             chunk_idx += 1
-            saved_count += 1
 
-    return f"✅ {scene_name} -> {save_dir.name}: {saved_count} chunks"
+    return f"✅ {scene_name} finished. Chunks: {chunk_idx}"
 
+# ========================================================
+# 主程序入口
+# ========================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_root", required=True, type=Path)
-    parser.add_argument("--output_root", required=True, type=Path)
-    parser.add_argument("--num_workers", default=4, type=int)
-    parser.add_argument("--grid_size", default=0.1, type=float)
-    args = parser.parse_args()
-
-    # 递归扫描 ply 目录下的所有文件
-    ply_files = sorted(list(args.dataset_root.glob("**/*.ply")))
+    # 扫描所有 ply 文件
+    ply_files = sorted(list(RAW_DATA_ROOT.glob("**/*.ply")))
+    print(f"🚀 Total scenes: {len(ply_files)} | Workers: {NUM_WORKERS}")
     
-    if not ply_files:
-        print(f"❌ No .ply files found in {args.dataset_root}")
-        exit(1)
-
-    print(f"🚀 Processing {len(ply_files)} scenes...")
-    
-    with ProcessPoolExecutor(max_workers=args.num_workers) as pool:
-        results = list(tqdm(pool.map(
-            process_scene,
-            ply_files,
-            repeat(args.output_root),
-            repeat(args.grid_size)
-        ), total=len(ply_files)))
+    # 多进程执行
+    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as pool:
+        results = list(tqdm(pool.map(process_scene, ply_files), total=len(ply_files)))
         
     for res in results:
         print(res)

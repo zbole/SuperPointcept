@@ -42,6 +42,7 @@ class DefaultDataset(Dataset):
         "segment",
         "instance",
         "pose",
+        "extra_feat",
     ]
 
     def __init__(
@@ -134,6 +135,9 @@ class DefaultDataset(Dataset):
 
         if "color" in data_dict.keys():
             data_dict["color"] = data_dict["color"].astype(np.float32)
+
+        if "extra_feat" in data_dict.keys():
+            data_dict["extra_feat"] = data_dict["extra_feat"].astype(np.float32)
 
         if "normal" in data_dict.keys():
             data_dict["normal"] = data_dict["normal"].astype(np.float32)
@@ -402,6 +406,9 @@ class DefaultImagePointDataset(Dataset):
 
         if "color" in data_dict.keys():
             data_dict["color"] = data_dict["color"].astype(np.float32)
+
+        if "extra_feat" in data_dict.keys():
+            data_dict["extra_feat"] = data_dict["extra_feat"].astype(np.float32)
 
         if "normal" in data_dict.keys():
             data_dict["normal"] = data_dict["normal"].astype(np.float32)
