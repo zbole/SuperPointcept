@@ -315,9 +315,25 @@ class Block(PointModule):
             DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         )
 
+        self.geo_mlp = nn.Sequential(
+            nn.Linear(4, channels // 4),  # 4 是你的先验维度
+            nn.GELU(),
+            nn.Linear(channels // 4, channels),
+            nn.Sigmoid() # 生成 0~1 的注意力权重
+        )
+
     def forward(self, point: Point):
         shortcut = point.feat
         point = self.cpe(point)
+
+        if "geo_prior" in point.keys():
+            # geo_attn 形状为 [N, channels]
+            geo_attn = self.geo_mlp(point.geo_prior)
+            # 用注意力权重去激活 xCPE 提取出的局部特征
+            point.feat = shortcut + point.feat * geo_attn
+        else:
+            point.feat = shortcut + point.feat
+            
         point.feat = shortcut + point.feat
         shortcut = point.feat
         if self.pre_norm:
@@ -419,6 +435,11 @@ class SerializedPooling(PointModule):
             coord=torch_scatter.segment_csr(
                 point.coord[indices], idx_ptr, reduce="mean"
             ),
+
+            geo_prior=torch_scatter.segment_csr(
+                point.geo_prior[indices], idx_ptr, reduce="mean"
+            ) if "geo_prior" in point.keys() else None,
+
             grid_coord=point.grid_coord[head_indices] >> pooling_depth,
             serialized_code=code,
             serialized_order=order,
@@ -426,6 +447,9 @@ class SerializedPooling(PointModule):
             serialized_depth=point.serialized_depth - pooling_depth,
             batch=point.batch[head_indices],
         )
+
+        if point_dict.geo_prior is None:
+            del point_dict["geo_prior"]
 
         if "condition" in point.keys():
             point_dict["condition"] = point.condition
@@ -698,6 +722,10 @@ class PointTransformerV3(PointModule):
 
     def forward(self, data_dict):
         point = Point(data_dict)
+
+        if point.feat.shape[1] >= 10:
+            point.geo_prior = point.feat[:, -4:].clone()
+
         point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
         point.sparsify()
 
