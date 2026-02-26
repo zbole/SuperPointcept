@@ -26,6 +26,8 @@ exit
 # 挂载文件到docker
 # 删除旧的容器
 sudo docker rm -f bole_lab_ptv3
+sudo docker rm -f bole_lab_final
+
 # ptv3
 sudo docker run --gpus all -it \
   --name bole_lab_ptv3 \
@@ -63,10 +65,12 @@ sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n SensatUrban-
 
 sh scripts/train.sh -g 1 -d stpls3d -c semseg-pt-v3m1-0-base-6cls-focal -n exp_stpls3d_5090_6cls_focal
 sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base-focal -n exp_sensaturban_5090_focal
-
+sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n sensaturban_5090
 新新的：
 
+sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n sensaturban_5090
 sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n exp_sensaturban_5090_plus
+sh scripts/test.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n exp_sensaturban_5090_plus_superCPE
 
 tumx笔记
 tmux new -s ptv3_train

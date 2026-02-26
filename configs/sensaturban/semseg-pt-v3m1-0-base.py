@@ -66,7 +66,7 @@ param_dicts = [dict(keyword="block", lr=0.0006)]
 # dataset settings
 dataset_type = "DefaultDataset" # ✅ 修正 Dataset 类型
 # ✅ 修正为 Docker 内部对应的绝对路径
-data_root = "/data/datasets/OpenDataLab___SensatUrban/data/processed_10d"
+data_root = "/data/datasets/sensaturban/processed_10d/"
 
 data = dict(
     num_classes=13,
@@ -143,7 +143,7 @@ data = dict(
     ),
     test=dict(
         type=dataset_type,
-        split="val",
+        split="test",
         data_root=data_root,
         transform=[
             dict(type="CenterShift", apply_z=True),

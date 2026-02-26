@@ -10,8 +10,8 @@ from plyfile import PlyData
 # ========================================================
 # 硬编码参数设置 (Hardcoded Parameters)
 # ========================================================
-RAW_DATA_ROOT = Path("../../../../../../data/datasets/OpenDataLab___SensatUrban/raw/SensatUrban/SensatUrban_Dataset/ply")
-OUT_DATA_ROOT = Path("../../../../../../data/datasets/OpenDataLab___SensatUrban/data/processed_10d")
+RAW_DATA_ROOT = Path("../../../../../../data/datasets/sensaturban/raw/")
+OUT_DATA_ROOT = Path("../../../../../../data/datasets/sensaturban/processed_10d")
 
 GRID_SIZE = 0.1         # 下采样格点大小
 NUM_WORKERS = 2         # 进程并行数 (建议设为 CPU 核心数)
