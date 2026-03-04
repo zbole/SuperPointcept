@@ -1,16 +1,17 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 2  # 显存够的话可以开大
-num_worker = 4
+batch_size = 10
+num_worker = 32
 mix_prob = 0.8
-empty_cache = True
-enable_amp = False # 建议开启 AMP 加速
+empty_cache = False
+enable_amp = True 
+amp_dtype = 'bfloat16'
 
 # model settings
 model = dict(
     type="DefaultSegmentorV2",
-    num_classes=13, # ✅ 修正为 13 类
+    num_classes=13,
     backbone_out_channels=64,
     backbone=dict(
         type="PT-v3m1",
@@ -51,22 +52,24 @@ model = dict(
 )
 
 # scheduler settings
-epoch = 100
-optimizer = dict(type="AdamW", lr=0.005, weight_decay=0.05) # SensatUrban 学习率稍微调大一点点
+epoch = 100  # 🚀 拓展句柄：想跑多久就改这个数，OneCycle 会自动拉伸它的“呼吸周期”
+optimizer = dict(type="AdamW", lr=0.005, weight_decay=0.05) 
+
 scheduler = dict(
     type="OneCycleLR",
-    max_lr=[0.006, 0.0006],
+    max_lr=0.006,             # ✅ 重点：只传一个数。Pointcept 会根据 param_dicts 自动缩放
     pct_start=0.05,
     anneal_strategy="cos",
     div_factor=10.0,
     final_div_factor=1000.0,
 )
+
 param_dicts = [dict(keyword="block", lr=0.0006)]
 
 # dataset settings
 dataset_type = "DefaultDataset" # ✅ 修正 Dataset 类型
 # ✅ 修正为 Docker 内部对应的绝对路径
-data_root = "/data/datasets/sensaturban/processed_10d/"
+data_root = "/datasets/sensaturban/processed_10d_grid_0.1/"
 
 data = dict(
     num_classes=13,
@@ -101,9 +104,9 @@ data = dict(
                 mode="train",
                 return_grid_coord=True,
             ),
-            # SensatUrban 点数很多，加上 SphereCrop 防止爆显存
             dict(type="SphereCrop", sample_rate=0.8, mode="random"),
-            dict(type="SphereCrop", point_max=200000, mode="random"), 
+            dict(type="SphereCrop", point_max=200000, mode="random"),
+
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
             dict(type="ToTensor"),
@@ -143,7 +146,7 @@ data = dict(
     ),
     test=dict(
         type=dataset_type,
-        split="test",
+        split="val",
         data_root=data_root,
         transform=[
             dict(type="CenterShift", apply_z=True),

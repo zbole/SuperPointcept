@@ -1,3 +1,6 @@
+Isambard:
+Could you run 'clifton auth' followed by 'clifton ssh-config write' and let me know if that resolves your connection problems
+
 0.安装conda环境
 
 1. 拉取支持 5090 的官方镜像  权限拦路虎！🐯
@@ -43,8 +46,10 @@ sudo docker run --gpus all -it \
   -v /data/datasets:/data/datasets \
   ptv3_gpu_image /bin/bash
 # 如果被关机
-sudo docker start -ai bole_lab_final
+sudo docker start -ai bole_lab_final bash
+sudo docker start -ai bole_lab_ptv3
 # 进入
+sudo docker exec -it bole_lab_ptv3 bash
 sudo docker exec -it bole_lab_final bash
 
 5.如有必要 检查：
@@ -58,21 +63,32 @@ python -c "import torch; print(f'Torch: {torch.__version__}, CUDA: {torch.versio
 
 export CUDA_LAUNCH_BLOCKING=1
 
-sh scripts/train.sh -g 1 -d stpls3d -c semseg-pt-v3m1-0-base -n exp_stpls3d_5090 -w model_best
-sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n SensatUrban-PTV3-Base -w model_best
-
+sh scripts/train.sh -g 1 -d stpls3d -c semseg-pt-v3m1-0-base -n exp_stpls3d_5090
+sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n SensatUrban-PTV3-Base
 新的训练脚本：
 
 sh scripts/train.sh -g 1 -d stpls3d -c semseg-pt-v3m1-0-base-6cls-focal -n exp_stpls3d_5090_6cls_focal
 sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base-focal -n exp_sensaturban_5090_focal
 sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n sensaturban_5090
+
 新新的：
 
 sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n sensaturban_5090
 sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n exp_sensaturban_5090_plus
-sh scripts/test.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n exp_sensaturban_5090_plus_superCPE
+sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n exp_sensaturban_5090_plus_superCPE_GeoSPD
+
+
+sh scripts/test.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n exp_sensaturban_5090_plus_superCPE -w model_last
+sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n exp_sensaturban_5090_plus_superCPE 
+
+sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n exp_sensaturban_5090_plus_superCPE -r true
 
 tumx笔记
+
+apt update
+apt install -y tmux
+
+
 tmux new -s ptv3_train
 先按 Ctrl + b，然后按 d (Detach)
 tmux attach -t ptv3_train
