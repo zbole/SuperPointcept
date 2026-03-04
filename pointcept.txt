@@ -100,3 +100,6 @@ tmux attach -t ptv3_train
 切换 Pane,方向键 ↑ ↓ ← →
 创建新窗口 (New Window),c
 切换窗口 (Next Window),n
+
+
+sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n exp_sensaturban_5090_plus_superCPE_GCDM

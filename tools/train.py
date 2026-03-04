@@ -13,6 +13,8 @@ from pointcept.engines.defaults import (
 from pointcept.engines.train import TRAINERS
 from pointcept.engines.launch import launch
 
+import torch
+torch.autograd.set_detect_anomaly(True)
 
 def main_worker(cfg):
     cfg = default_setup(cfg)

@@ -101,6 +101,18 @@ class SerializedAttention(PointModule):
         self.softmax = torch.nn.Softmax(dim=-1)
         self.rpe = RPE(patch_size, num_heads) if self.enable_rpe else None
 
+        # Phase 2: GCDM - Geometry-Conditioned Dynamic Metric Generator
+        # 用轻量级 MLP 将 4D geometry prior 映射为度量张量
+        self.metric_mlp = nn.Sequential(
+            nn.Linear(4, channels // 4),
+            nn.GELU(),
+            nn.Linear(channels // 4, channels)
+        )
+        
+        # (Identity Initialization)
+        nn.init.constant_(self.metric_mlp[-1].weight, 0.0)
+        nn.init.constant_(self.metric_mlp[-1].bias, 1.0)
+
     @torch.no_grad()
     def get_rel_pos(self, point, order):
         K = self.patch_size
@@ -187,6 +199,28 @@ class SerializedAttention(PointModule):
         # padding and reshape feat and batch for serialized point patch
         qkv = self.qkv(point.feat)[order]
 
+
+        # =========================================================
+        # Phase 2: GCDM Core - Apply Pseudo-Riemannian Metric
+        # =========================================================
+        if hasattr(point, 'geo_prior') and point.geo_prior is not None:
+            # 1. 提取当前 sorting order 下的几何特征，生成 Metric Tensor m
+            m = self.metric_mlp(point.geo_prior[order])  # [N', C]
+            m = m.reshape(-1, H, C // H)                 # 适配多头维度 [N', H, C//H]
+
+            # 2. 将 qkv 展开
+            qkv = qkv.reshape(-1, 3, H, C // H)
+            
+            # 3. 施加各向异性度量： Q' = Q ⊙ m (安全写法，防止 PyTorch In-place 报错)
+            q, k, v = qkv.unbind(dim=1)  # 解包出分离的 q, k, v，切断原内存依赖
+            q = q * m                    # 这里产生一个全新的 q 张量，保留完整的计算图
+            qkv = torch.stack([q, k, v], dim=1) # 重新安全堆叠回 [N', 3, H, C//H]
+
+            # 4. 如果没开 flash_attn，需要把 qkv 展平回去以适配后续非 flash 代码
+            if not self.enable_flash:
+                qkv = qkv.reshape(-1, C * 3)
+        # =========================================================
+
         if not self.enable_flash:
             # encode and reshape qkv: (N', K, 3, H, C') => (3, N', H, K, C')
             q, k, v = (
@@ -205,6 +239,7 @@ class SerializedAttention(PointModule):
             attn = self.attn_drop(attn).to(qkv.dtype)
             feat = (attn @ v).transpose(1, 2).reshape(-1, C)
         else:
+            # FlashAttention 分支: 直接送入带度量扭曲的 qkv
             feat = flash_attn.flash_attn_varlen_qkvpacked_func(
                 qkv.to(torch.bfloat16).reshape(-1, 3, H, C // H),
                 cu_seqlens,
@@ -213,6 +248,7 @@ class SerializedAttention(PointModule):
                 softmax_scale=self.scale,
             ).reshape(-1, C)
             feat = feat.to(qkv.dtype)
+            
         feat = feat[inverse]
 
         # ffn
@@ -316,29 +352,32 @@ class Block(PointModule):
         )
 
         self.geo_mlp = nn.Sequential(
-            nn.Linear(4, channels // 4),  # 4 是你的先验维度
+            nn.Linear(4, channels // 4),  # 4 是先验维度 (Lambda 1,2,3 + Density)
             nn.GELU(),
             nn.Linear(channels // 4, channels),
-            nn.Sigmoid() # 生成 0~1 的注意力权重
+            nn.Sigmoid() # 生成 0~1 的 Excitation weight
         )
 
     def forward(self, point: Point):
         shortcut = point.feat
         point = self.cpe(point)
 
-        if "geo_prior" in point.keys():
-            # geo_attn 形状为 [N, channels]
+        # Phase 1: Feature Excitation
+        # 利用你的 geo_mlp 提亮高频边缘/几何特征
+        if hasattr(point, 'geo_prior') and point.geo_prior is not None:
             geo_attn = self.geo_mlp(point.geo_prior)
-            # 用注意力权重去激活 xCPE 提取出的局部特征
             point.feat = shortcut + point.feat * geo_attn
         else:
             point.feat = shortcut + point.feat
             
-        point.feat = shortcut + point.feat
         shortcut = point.feat
         if self.pre_norm:
             point = self.norm1(point)
+            
+        # Phase 2: GCDM Attention Routing
+        # 这里进入的特征已经被 Phase 1 激活，而在 attn 内部将通过几何度量拒绝 Oversmoothing
         point = self.drop_path(self.attn(point))
+        
         point.feat = shortcut + point.feat
         if not self.pre_norm:
             point = self.norm1(point)
