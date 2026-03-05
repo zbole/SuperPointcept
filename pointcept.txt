@@ -83,6 +83,8 @@ sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n exp_sensatur
 
 sh scripts/train.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n exp_sensaturban_5090_plus_superCPE -r true
 
+sh scripts/test.sh -g 1 -d sensaturban -c semseg-pt-v3m1-0-base -n exp_sensaturban_5090_plus_superCPE
+
 tumx笔记
 
 apt update
