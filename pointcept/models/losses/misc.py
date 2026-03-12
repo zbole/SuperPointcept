@@ -221,3 +221,89 @@ class DiceLoss(nn.Module):
                 total_loss += dice_loss
         loss = total_loss / num_classes
         return self.loss_weight * loss
+
+
+@LOSSES.register_module()
+class OHEMCrossEntropyLoss(nn.Module):
+    def __init__(self, keep_ratio=0.7, loss_weight=1.0, ignore_index=255):
+        """
+        keep_ratio: 保留 loss 最大的前多少比例的点 (0 < keep_ratio <= 1)
+        """
+        super(OHEMCrossEntropyLoss, self).__init__()
+        self.keep_ratio = keep_ratio
+        self.loss_weight = loss_weight
+        self.ignore_index = ignore_index
+
+    def forward(self, pred, target):
+        # 1. 计算 point-wise 的 raw Cross Entropy Loss (reduction='none' 保证输出形状为 (N,))
+        losses = F.cross_entropy(pred, target, ignore_index=self.ignore_index, reduction='none')
+        
+        # 2. 过滤掉被 ignore 的无效点
+        valid_mask = target != self.ignore_index
+        valid_losses = losses[valid_mask]
+        
+        # 防止极端情况下 batch 内全是被 ignore 的点
+        if valid_losses.numel() == 0:
+            return losses.sum() * 0.0
+            
+        # 3. 计算需要保留的 hard examples 数量
+        num_keep = int(valid_losses.numel() * self.keep_ratio)
+        num_keep = max(1, num_keep) # 至少保留一个点
+        
+        # 4. 核心优化：使用 topk 提取 Loss 最大的点
+        if num_keep < valid_losses.numel():
+            topk_losses, _ = valid_losses.topk(num_keep)
+        else:
+            topk_losses = valid_losses
+            
+        # 5. 求 mean 并乘以权重
+        loss = topk_losses.mean()
+        
+        return loss * self.loss_weight
+
+@LOSSES.register_module()
+class TargetRepulsionLoss(nn.Module):
+    def __init__(self, target_classes, margin=0.0, loss_weight=1.0, ignore_index=255):
+        super(TargetRepulsionLoss, self).__init__()
+        self.target_classes = target_classes
+        self.margin = margin
+        self.loss_weight = loss_weight
+        self.ignore_index = ignore_index
+
+    def forward(self, features, target):
+        # 1. 过滤 ignore_index
+        valid_mask = target != self.ignore_index
+        features = features[valid_mask]
+        target = target[valid_mask]
+
+        if features.shape[0] == 0:
+            return (features.sum() * 0.0).requires_grad_(True)
+
+        # 2. 找出目标和背景
+        target_mask = torch.isin(target, torch.tensor(self.target_classes, device=target.device))
+        
+        # 【极致优化 1】：不再需要 bg_mask 和全量 bg_feats
+        # 直接拿全体点的平均特征，或者非目标点的平均特征作为 Background Prototype
+        bg_feats = features[~target_mask]
+
+        if target_mask.sum() == 0 or bg_feats.shape[0] == 0:
+            return (features.sum() * 0.0).requires_grad_(True)
+
+        target_feats = features[target_mask]
+
+        # 【极致优化 2】：计算背景的原型 (Mean Prototype)，并阻断梯度！
+        # .detach() 是灵魂！它让庞大的背景点前向传播图直接被丢弃，不计算梯度，省下海量时间和显存
+        bg_prototype = bg_feats.mean(dim=0, keepdim=True).detach() 
+
+        # 3. L2 归一化
+        target_feats_norm = F.normalize(target_feats, p=2, dim=1)
+        bg_prototype_norm = F.normalize(bg_prototype, p=2, dim=1)
+
+        # 【极致优化 3】：变成 O(N) 的点乘，彻底消灭 N^2 的矩阵乘法和 randperm
+        # 每个 target point 只和那个唯一的 bg_prototype 算相似度
+        sim_vector = torch.sum(target_feats_norm * bg_prototype_norm, dim=1) 
+
+        # 4. 计算排斥 Loss
+        loss = torch.relu(sim_vector - self.margin).mean()
+
+        return loss * self.loss_weight

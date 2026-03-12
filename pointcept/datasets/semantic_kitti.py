@@ -9,7 +9,14 @@ import os
 import numpy as np
 from PIL import Image
 import torch
-import open3d as o3d
+from typing import TYPE_CHECKING
+
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import open3d as o3d
+else:
+    o3d = Any
 import random
 
 from .builder import DATASETS
@@ -527,6 +534,7 @@ class SemanticKITTIImagePointDataset(DefaultImagePointDataset):
         Cs = np.repeat(cam_center.reshape((1, -1)), coords.shape[0], axis=0)
         view_dirs = coords - Cs
         view_dirs = view_dirs / np.linalg.norm(view_dirs, axis=-1, keepdims=True)
+        import open3d as o3d
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(coords)
         pcd.estimate_normals()

@@ -10,7 +10,12 @@ import numpy as np
 from collections.abc import Sequence
 import pickle
 from PIL import Image
-import open3d as o3d
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import open3d as o3d
+else:
+    o3d = Any
 import torch
 
 from .builder import DATASETS

@@ -1,7 +1,7 @@
 """
 Point Transformer - V3 Mode1
 
-Author: Xiaoyang Wu (xiaoyang.wu.cs@gmail.com)
+Author: Bole Zhang (al25703@bristol.ac.uk)
 Please cite our work if the code is helpful to you.
 """
 
@@ -187,15 +187,29 @@ class SerializedAttention(PointModule):
         # padding and reshape feat and batch for serialized point patch
         qkv = self.qkv(point.feat)[order]
 
+        # ===================================================================== #
+        # >>> GCDM 注入区 (Zero-Overhead Integration) >>>
+        # ===================================================================== #
+        m = None
+        if hasattr(point, 'metric_m') and point.metric_m is not None:
+            m = point.metric_m[order]
+        # ===================================================================== #
+        # <<< GCDM 注入区 结束 <<<
+        # ===================================================================== #
+
         if not self.enable_flash:
-            # encode and reshape qkv: (N', K, 3, H, C') => (3, N', H, K, C')
-            q, k, v = (
-                qkv.reshape(-1, K, 3, H, C // H).permute(2, 0, 3, 1, 4).unbind(dim=0)
-            )
-            # attn
+            # 禁用 FlashAttention 时的纯 PyTorch 分支
+            q, k, v = qkv.reshape(-1, K, 3, H, C // H).permute(2, 0, 3, 1, 4).unbind(dim=0)
+            
+            if m is not None:
+                # m_i 维度对齐: (N', K, C) -> (N', K, H, C//H) -> (N', H, K, C//H)
+                m = m.reshape(-1, K, H, C // H).permute(0, 2, 1, 3)
+                q = q * m # 伪黎曼空间度量变换： \tilde{Q} = Q \odot m
+
             if self.upcast_attention:
                 q = q.float()
                 k = k.float()
+
             attn = (q * self.scale) @ k.transpose(-2, -1)  # (N', H, K, K)
             if self.enable_rpe:
                 attn = attn + self.rpe(self.get_rel_pos(point, order))
@@ -205,14 +219,24 @@ class SerializedAttention(PointModule):
             attn = self.attn_drop(attn).to(qkv.dtype)
             feat = (attn @ v).transpose(1, 2).reshape(-1, C)
         else:
+            qkv = qkv.reshape(-1, 3, H, C // H)
+            
+            if m is not None:
+                m = m.reshape(-1, H, C // H)
+                # 【修改点】：安全解包，乘法操作后重新打包，避免 In-place 报错
+                q, k, v = qkv.unbind(dim=1)  # q, k, v shape: (N, H, C//H)
+                q = q * m                    # Out-of-place 计算伪黎曼度量
+                qkv = torch.stack([q, k, v], dim=1) # 重新堆叠回 (-1, 3, H, C//H)
+
             feat = flash_attn.flash_attn_varlen_qkvpacked_func(
-                qkv.to(torch.bfloat16).reshape(-1, 3, H, C // H),
+                qkv.to(torch.bfloat16),
                 cu_seqlens,
                 max_seqlen=self.patch_size,
                 dropout_p=self.attn_drop if self.training else 0,
                 softmax_scale=self.scale,
             ).reshape(-1, C)
             feat = feat.to(qkv.dtype)
+            
         feat = feat[inverse]
 
         # ffn
@@ -269,10 +293,12 @@ class Block(PointModule):
         enable_flash=True,
         upcast_attention=True,
         upcast_softmax=True,
+        stage_index=0,
     ):
         super().__init__()
         self.channels = channels
         self.pre_norm = pre_norm
+        self.stage_index = stage_index
 
         self.cpe = PointSequential(
             spconv.SubMConv3d(
@@ -315,34 +341,74 @@ class Block(PointModule):
             DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         )
 
-        self.geo_mlp = nn.Sequential(
-            nn.Linear(4, channels // 4),  # 4 是你的先验维度
+        # ✅ 1. SuperCPE (geo_mlp): 只有浅层 (Stage 0 和 1) 才初始化，节省参数
+        if self.stage_index < 2:
+            self.geo_mlp = nn.Sequential(
+                nn.Linear(4, channels // 4),
+                nn.GELU(),
+                nn.Linear(channels // 4, channels),
+                nn.Sigmoid() 
+            )
+        else:
+            self.geo_mlp = None
+
+        self.metric_mlp_geo = nn.Sequential(
+            nn.Linear(4, channels // 4),
             nn.GELU(),
             nn.Linear(channels // 4, channels),
-            nn.Sigmoid() # 生成 0~1 的注意力权重
+            nn.Sigmoid() 
         )
+        
+        # ✅ 2. 修改点：现在的 DINO 先验已经对齐了当前 stage 的通道数
+        self.metric_mlp_dino = nn.Sequential(
+            nn.Linear(channels, channels // 4), # 从 6 改为 channels
+            nn.GELU(),
+            nn.Linear(channels // 4, channels),
+            nn.Sigmoid() 
+        )
+        
+        nn.init.zeros_(self.metric_mlp_geo[-2].weight)
+        nn.init.zeros_(self.metric_mlp_geo[-2].bias)
+        nn.init.zeros_(self.metric_mlp_dino[-2].weight)
+        nn.init.zeros_(self.metric_mlp_dino[-2].bias)
 
     def forward(self, point: Point):
+        # 1. CPE 提取局部特征
         shortcut = point.feat
         point = self.cpe(point)
 
-        if "geo_prior" in point.keys():
-            # geo_attn 形状为 [N, channels]
-            geo_attn = self.geo_mlp(point.geo_prior)
-            # 用注意力权重去激活 xCPE 提取出的局部特征
-            point.feat = shortcut + point.feat * geo_attn
+        # 2. Phase 1 & 2: 几何特征激发 与 度量张量生成
+        if hasattr(point, "geo_prior"):
+            if self.stage_index < 2 and self.geo_mlp is not None:
+                geo_attn = self.geo_mlp(point.geo_prior)
+                point.feat = shortcut + point.feat * (1.0 + geo_attn) 
+            else:
+                point.feat = shortcut + point.feat
+
+            # Phase 2: GCDM - 交叉门控度量
+            geo_gate = self.metric_mlp_geo(point.geo_prior) * 2.0 
+            
+            if hasattr(point, "dino_prior"):
+                dino_gate = self.metric_mlp_dino(point.dino_prior)
+                point.metric_m = geo_gate * dino_gate
+            else:
+                point.metric_m = geo_gate
         else:
             point.feat = shortcut + point.feat
-            
-        point.feat = shortcut + point.feat
+            point.metric_m = None
+
+        # 3. Attention 模块 (自带残差)
         shortcut = point.feat
         if self.pre_norm:
             point = self.norm1(point)
+            
         point = self.drop_path(self.attn(point))
         point.feat = shortcut + point.feat
+
         if not self.pre_norm:
             point = self.norm1(point)
 
+        # 4. MLP 模块 (自带残差)
         shortcut = point.feat
         if self.pre_norm:
             point = self.norm2(point)
@@ -350,6 +416,7 @@ class Block(PointModule):
         point.feat = shortcut + point.feat
         if not self.pre_norm:
             point = self.norm2(point)
+            
         point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
         return point
 
@@ -439,6 +506,11 @@ class SerializedPooling(PointModule):
             geo_prior=torch_scatter.segment_csr(
                 point.geo_prior[indices], idx_ptr, reduce="mean"
             ) if "geo_prior" in point.keys() else None,
+            
+            # ✅ 新增：把 dino_prior 也做 Mean Pooling 传下去
+            dino_prior=torch_scatter.segment_csr(
+                point.dino_prior[indices], idx_ptr, reduce="mean"
+            ) if "dino_prior" in point.keys() else None,
 
             grid_coord=point.grid_coord[head_indices] >> pooling_depth,
             serialized_code=code,
@@ -450,6 +522,8 @@ class SerializedPooling(PointModule):
 
         if point_dict.geo_prior is None:
             del point_dict["geo_prior"]
+        if point_dict.dino_prior is None:
+            del point_dict["dino_prior"]
 
         if "condition" in point.keys():
             point_dict["condition"] = point.condition
@@ -623,6 +697,14 @@ class PointTransformerV3(PointModule):
             act_layer=act_layer,
         )
 
+        # ✅ 新增：DINOv3 768D 高维特征适配器 (Dimension Alignment)
+        # 负责将 768 维映射到 PTV3 的初始维度 (enc_channels[0])
+        self.dino_adapter = nn.Sequential(
+            nn.Linear(768, enc_channels[0]),
+            nn.LayerNorm(enc_channels[0]),
+            nn.GELU()
+        )
+
         # encoder
         enc_drop_path = [
             x.item() for x in torch.linspace(0, drop_path, sum(enc_depths))
@@ -665,6 +747,7 @@ class PointTransformerV3(PointModule):
                         enable_flash=enable_flash,
                         upcast_attention=upcast_attention,
                         upcast_softmax=upcast_softmax,
+                        stage_index=s,
                     ),
                     name=f"block{i}",
                 )
@@ -715,6 +798,7 @@ class PointTransformerV3(PointModule):
                             enable_flash=enable_flash,
                             upcast_attention=upcast_attention,
                             upcast_softmax=upcast_softmax,
+                            stage_index=s,
                         ),
                         name=f"block{i}",
                     )
@@ -722,21 +806,43 @@ class PointTransformerV3(PointModule):
 
     def forward(self, data_dict):
         point = Point(data_dict)
+        # 🚨 维度校验：3 Coord + 3 Color + 4 Geo + 768 DINO = 778
+        assert point.feat.shape[1] == 778, \
+                    f"🚨 致命错误：期望输入特征为 778 维，但实际收到了 {point.feat.shape[1]} 维！请检查 Data Pipeline。"
+        
+        # 🛡️ 精准切片提取
+        base_feat = point.feat[:, 0:6].clone()       # [N, 6]   给 SpConv
+        point.geo_prior = point.feat[:, 6:10].clone() # [N, 4]   物理先验
+        
+        # ⚠️ 提取 DINO 时直接转为适合深度学习框架的类型
+        dino_raw_768d = point.feat[:, 10:778].clone().to(torch.bfloat16)
 
-        if point.feat.shape[1] >= 10:
-            point.geo_prior = point.feat[:, -4:].clone()
+        # 核心重组：重置 point.feat，只让基础 6D 进 SpConv
+        point.feat = base_feat 
+
+        assert point.feat.shape[1] == self.embedding.in_channels, \
+            f"🚨 维度坍缩：重组后的特征为 {point.feat.shape[1]} 维，但 Config 里 in_channels 是 {self.embedding.in_channels}！"
 
         point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
         point.sparsify()
 
-        point = self.embedding(point)
+        # 1. 纯净流形提取 (6D -> 32D/64D)
+        point = self.embedding(point) 
+        
+        # 2. 旁路对齐：将 768 维语义特征降维到当前 stage 的维度
+        dino_aligned = self.dino_adapter(dino_raw_768d.to(point.feat.dtype))
+        
+        # 3. 及时释放高维巨无霸张量，拯救你的显存
+        del dino_raw_768d 
+        
+        # 4. Feature-level Soft Fusion (特征层融合)
+        point.feat = point.feat + dino_aligned
+        
+        # 5. 将处理好的特征挂载到 dino_prior，供下游 Block 里的 GCDM 调用
+        point.dino_prior = dino_aligned
+
         point = self.enc(point)
         if not self.enc_mode:
             point = self.dec(point)
-        # else:
-        #     point.feat = torch_scatter.segment_csr(
-        #         src=point.feat,
-        #         indptr=nn.functional.pad(point.offset, (1, 0)),
-        #         reduce="mean",
-        #     )
+            
         return point

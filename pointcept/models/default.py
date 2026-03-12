@@ -17,6 +17,7 @@ class DefaultSegmentor(nn.Module):
         super().__init__()
         self.backbone = build_model(backbone)
         self.criteria = build_criteria(criteria)
+        
 
     def forward(self, input_dict):
         if "condition" in input_dict.keys():

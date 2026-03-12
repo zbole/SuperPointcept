@@ -25,4 +25,4 @@ log/
 
 # Ignore datasets
 data/
-dataset/
+**/core

@@ -1,5 +1,5 @@
 from .builder import build_criteria, LOSSES
 
-from .misc import CrossEntropyLoss, SmoothCELoss, DiceLoss, FocalLoss, BinaryFocalLoss
+from .misc import CrossEntropyLoss, SmoothCELoss, DiceLoss, FocalLoss, BinaryFocalLoss, OHEMCrossEntropyLoss
 from .lovasz import LovaszLoss
 from .focal_loss import FocalLoss
