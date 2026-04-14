@@ -207,7 +207,24 @@ class SerializedAttention(PointModule):
                 attn = attn + self.rpe(self.get_rel_pos(point, order))
             if self.upcast_softmax:
                 attn = attn.float()
+            
+            # --- 计算 Softmax ---
             attn = self.softmax(attn)
+
+            # =====================================================================
+            # 🚀 核心修改：可视化 Hook 注入区
+            # =====================================================================
+            if "extract_attn" in point.keys() and point["extract_attn"]:
+                if "attn_maps" not in point.keys():
+                    point["attn_maps"] = []
+                    point["attn_orders"] = []
+                
+                # detach 并转移到 cpu 防止爆显存
+                point["attn_maps"].append(attn.detach().cpu()) 
+                point["attn_orders"].append(order.detach().cpu())
+                point["attn_patch_size"] = K
+            # =====================================================================
+
             attn = self.attn_drop(attn).to(qkv.dtype)
             feat = (attn @ v).transpose(1, 2).reshape(-1, C)
         else:
