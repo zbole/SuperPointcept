@@ -1,50 +1,50 @@
 #!/bin/bash
-#SBATCH --job-name=PTV3_Vis_Attn
+#SBATCH --job-name=Profile_DPT
 #SBATCH --partition=workq
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=2     # 明确只申请 2 个 CPU 核心
-#SBATCH --time=00:20:00       # 时间压榨到 20 分钟！(时间越短，越容易被系统塞进去)
-#SBATCH --mem=300G             # 内存降到 32G！(单块点云前向传播 32G 绝对够了)
-#SBATCH --output=logs/vis_attention_%j.log
-#SBATCH --error=logs/vis_attention_%j.err
+#SBATCH --time=02:00:00  # 🚀 测算任务很快，申请 2 小时可以更快排进队列
+#SBATCH --mem=64G        # 🚀 推理不需要占用太多 CPU 内存，64G 足够了
+#SBATCH --output=logs/profile_efficiency_%j.log
+#SBATCH --error=logs/profile_efficiency_%j.err
 
 export ENV_DIR=/home/b6ae/bolezhang.b6ae/Pointcept
 export CODE_DIR=$SLURM_SUBMIT_DIR
 export SIF_FILE=$ENV_DIR/pytorch_24.08.sif
 
-# 确保 python 输出实时打印，不被缓存
 export PYTHONUNBUFFERED=1
 
 export PYTHONUSERBASE=$ENV_DIR/.pip
 export PYTHONPATH=$CODE_DIR:$ENV_DIR/cumm:$ENV_DIR/spconv:$PYTHONPATH
 export PATH=$ENV_DIR/.pip/bin:$PATH
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
-
-# 适配 GH200 架构
 export TORCH_CUDA_ARCH_LIST="9.0a"
 
+# 🛡️ 防 OOM 底层护盾
 export MALLOC_ARENA_MAX=1
 export OMP_NUM_THREADS=4
 
-export TMPDIR=/dev/shm/tmp_${SLURM_JOB_ID}
+export TMPDIR=/tmp/slurm_tmp_${SLURM_JOB_ID}
 mkdir -p $TMPDIR
-mkdir -p logs  # 确保 logs 文件夹存在，防止 slurm 报错
+
+# 🚀 指向 Lustre 上的数据源
+export DATA_DIR=/lus/lfs1aip2/projects/b6ae/datasets/sensaturban/processed_1025D_SP-PT
 
 echo "=========================================================="
-echo "🚀 Starting Visualization Job $SLURM_JOB_ID on $(hostname)"
+echo "🚀 Running Efficiency Profiler Job $SLURM_JOB_ID on $(hostname)"
 echo "=========================================================="
 
+# 🚀 预检：打印分配到的 GPU 信息
 echo "📊 Checking GPU Status..."
 nvidia-smi
 echo "=========================================================="
 
-# 🚀 容器化执行你的 Python 可视化脚本
 apptainer exec --nv \
   --cleanenv \
   --containall \
   -B $CODE_DIR:/workspace \
   -B $ENV_DIR:$ENV_DIR \
+  -B $DATA_DIR:/datasets/sensaturban/processed_1025D_SP-PT \
   -B /lus:/lus \
   -B $TMPDIR:/tmp \
   $SIF_FILE \
@@ -54,9 +54,8 @@ apptainer exec --nv \
     export PYTHONUSERBASE=$ENV_DIR/.pip
     export PATH=$ENV_DIR/.pip/bin:\$PATH
     
-    echo '🎨 Running Attention Visualization Script...'
-    python visualize_attention2.py
+    # 🚀 核心命令：直接运行效率测试脚本
+    python tools/pro_benchmark.py
   "
 
 rm -rf $TMPDIR
-echo "🎉 Job Completed!"

@@ -16,7 +16,7 @@ from plyfile import PlyData
 dataset_root = Path("/lus/lfs1aip2/projects/b6ae/datasets/sensaturban").resolve()
 RAW_DATA_ROOT = dataset_root / "raw"
 # 🚀 你的全新轻量化、统一 1025D 数据集目录
-OUT_DATA_ROOT = dataset_root / "processed_1025D_SP-PT" 
+OUT_DATA_ROOT = dataset_root / "processed-dpt2" 
 
 # 模型权重路径 (与脚本同目录的 weights 文件夹)
 WEIGHT_PATH = Path("./weights").resolve()
@@ -181,7 +181,8 @@ def process_scene(scene_path, extractor):
             down_colors = torch.tensor(down_colors_np, dtype=torch.float32)
             
             # 极速提取 1024D DINO 先验
-            down_features = extractor.extract_and_lift_features(down_coords, down_colors, resolution=0.5)
+            # 1个像素代表点云中 0.5m x 0.1m 的区域
+            down_features = extractor.extract_and_lift_features(down_coords, down_colors, resolution=0.1)
             
             # 映射回 0.1m 分辨率的点云
             kdtree = cKDTree(down_coords_np)

@@ -110,53 +110,68 @@ def process_scene(scene_path, extractor):
     scene_path = Path(scene_path)
     scene_name = scene_path.stem.lower()
     
-    # 划分数据集 (Birmingham & Cambridge)
-    if "train" in str(scene_path):
-        VAL_LIST = ["birmingham_block_1", "birmingham_block_6", "cambridge_block_12", "cambridge_block_6"]
-        split = "val" if any(b in scene_name for b in VAL_LIST) else "train"
-    else:
-        split = "test"
+    # ========================================================
+    # 🚀 极其干脆：无视文件名，全部强行存入 val！
+    # ========================================================
+    split = "val"
         
     save_dir = OUT_DATA_ROOT / split
     save_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n📂 Loading RAW file: {scene_path.name} -> saving to [{split}] ...")
     try:
-        # 🚀 新增：文件格式判断与加载逻辑
         if scene_path.suffix.lower() == '.ply':
             with open(str(scene_path), 'rb') as f:
-                v = PlyData.read(f)['vertex']
+                ply_data = PlyData.read(f)
+                v = ply_data['vertex']
             pts = np.stack([v['x'], v['y'], v['z']], axis=1).astype(np.float32)
             rgb = np.stack([v['red'], v['green'], v['blue']], axis=1).astype(np.uint8)
-            sem = v['class'].astype(np.int16) if 'class' in v else np.full(len(pts), 255)
+            
+            # ========================================================
+            # 🚀 全方位捕获真实标签 (Ground Truth)
+            # ========================================================
+            vertex_properties = [p.name for p in ply_data['vertex'].properties]
+            
+            if 'class' in vertex_properties:
+                sem = v['class'].astype(np.int16)
+            elif 'label' in vertex_properties:
+                sem = v['label'].astype(np.int16)
+            elif 'scalar_class' in vertex_properties:
+                sem = v['scalar_class'].astype(np.int16)
+            elif 'classification' in vertex_properties:
+                sem = v['classification'].astype(np.int16)
+            else:
+                print(f"⚠️ 警告：在 {scene_path.name} 中未找到任何常规的标签列！可用列为: {vertex_properties}")
+                print("💡 将全部填充为 255 (Ignore)。")
+                sem = np.full(len(pts), 255)
             
         elif scene_path.suffix.lower() == '.bin':
-            # 假设是 Raw Binary 格式: [X, Y, Z, R, G, B] (float32)
             raw_data = np.fromfile(scene_path, dtype=np.float32)
-            
-            # 推断通道数 (通常是 6 通道 XYZRGB)
             if len(raw_data) % 6 == 0:
                 raw_data = raw_data.reshape(-1, 6)
                 pts = raw_data[:, 0:3]
-                # 某些 bin 文件的 RGB 是 0-1 之间的 float，这里统一转为 0-255 uint8
                 if raw_data[:, 3:6].max() <= 1.0:
                     rgb = (raw_data[:, 3:6] * 255).astype(np.uint8)
                 else:
                     rgb = raw_data[:, 3:6].astype(np.uint8)
                 sem = np.full(len(pts), 255)
+            elif len(raw_data) % 7 == 0:
+                raw_data = raw_data.reshape(-1, 7)
+                pts = raw_data[:, 0:3]
+                rgb = (raw_data[:, 3:6] * 255).astype(np.uint8) if raw_data[:, 3:6].max() <= 1.0 else raw_data[:, 3:6].astype(np.uint8)
+                sem = raw_data[:, 6].astype(np.int16)
             else:
-                raise ValueError(f"❌ Binary data shape mismatch! Total elements {len(raw_data)} cannot be divided by 6.")
+                raise ValueError(f"❌ Binary data shape mismatch! Total elements {len(raw_data)} cannot be divided by 6 or 7.")
         else:
             print(f"❌ Unsupported format: {scene_path.suffix}")
             return
             
     except Exception as e: 
         print(f"❌ Load Error: {e}")
-        # 如果走到这里报错，99% 的概率是因为这个 bin 是 CloudCompare 的专属工程文件！
-        print("💡 Hint: If this .bin file was saved directly from CloudCompare, it cannot be read! Please export it as a .PLY file instead.")
         return
 
-    print(f"📊 Loaded {len(pts)} points successfully.")
+    # 打印提取到的唯一标签，让你心里有底
+    print(f"📊 Loaded {len(pts)} points successfully. Unique labels found: {np.unique(sem)}")
 
     # 1. 基础分辨率降采样 (0.1m)
     pts -= pts.min(axis=0)
@@ -164,18 +179,18 @@ def process_scene(scene_path, extractor):
     _, idx = np.unique(grid_coord, axis=0, return_index=True)
     pts, rgb, sem = pts[idx], rgb[idx], sem[idx]
     
-    # 2. 计算全局高度归一化先验 (统一的 1D 物理特征)
+    # 2. 计算全局高度归一化先验
     print("📐 Computing Physical Priors (Rel_Z)...")
     z_floor = np.percentile(pts[:, 2], 0.1)
     global_rel_z = (pts[:, 2:3] - z_floor).astype(np.float32)
-    global_rel_z = np.clip(global_rel_z / 100.0, 0.0, 1.0) # 归一化防止梯度爆炸
+    global_rel_z = np.clip(global_rel_z / 100.0, 0.0, 1.0) 
     
     # 3. 空间切块并提取 DINO (50m x 50m)
     x_max, y_max = pts.max(axis=0)[:2]
     chunk_count = 0
     
-    # 动态步长: 训练集重叠增强(25m)，验证集/测试集无缝拼接(50m)避免测试泄露
-    stride = 25 if split == "train" else 50
+    # 既然是强行放 val，切块步长直接给 50m (无重叠)
+    stride = 50
     
     print(f"✂️ Chunking (Stride: {stride}m) & Extracting DINOv3...")
     for x in np.arange(0, x_max, stride):
@@ -185,7 +200,6 @@ def process_scene(scene_path, extractor):
             
             chunk_folder = save_dir / f"{scene_name}_{chunk_count}"
             
-            # 断点续传保护
             if (chunk_folder / "extra_feat.npy").exists():
                 chunk_count += 1
                 continue
@@ -197,7 +211,6 @@ def process_scene(scene_path, extractor):
             sem_chunk = sem[mask]
             rel_z_chunk = global_rel_z[mask]
             
-            # 模拟 voxel_down_sample(0.5m) 用于 DINO 提特征
             grid_coord_05 = np.floor(pts_chunk / 0.5).astype(int)
             _, idx_05 = np.unique(grid_coord_05, axis=0, return_index=True)
             down_coords_np = pts_chunk[idx_05]
@@ -206,18 +219,14 @@ def process_scene(scene_path, extractor):
             down_coords = torch.tensor(down_coords_np, dtype=torch.float32)
             down_colors = torch.tensor(down_colors_np, dtype=torch.float32)
             
-            # 极速提取 1024D DINO 先验
             down_features = extractor.extract_and_lift_features(down_coords, down_colors, resolution=0.5)
             
-            # 映射回 0.1m 分辨率的点云
             kdtree = cKDTree(down_coords_np)
             _, indices = kdtree.query(pts_chunk, k=1, workers=-1)
             full_res_dino = down_features[indices].numpy()
             
-            # 🚀 统一输出结构：[Rel_Z (1), DINO (1024)] = 1025D
             extra_feat = np.concatenate([rel_z_chunk, full_res_dino], axis=1).astype(np.float32)
             
-            # 保存数据
             np.save(chunk_folder / "coord.npy", pts_chunk)
             np.save(chunk_folder / "color.npy", rgb_chunk)
             np.save(chunk_folder / "segment.npy", sem_chunk)
@@ -225,7 +234,7 @@ def process_scene(scene_path, extractor):
             
             chunk_count += 1
 
-    print(f"✅ {scene_name} processed: {chunk_count} chunks generated.")
+    print(f"✅ {scene_name} processed: {chunk_count} chunks generated into [val].")
 
 # ========================================================
 # 4. 主函数启动器

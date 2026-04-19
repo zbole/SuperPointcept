@@ -847,3 +847,236 @@ class PointTransformerV3(PointModule):
             point = self.dec(point)
             
         return point
+
+import torch
+import torch.nn as nn
+from pointcept.models.builder import MODELS, build_model
+
+@MODELS.register_module("QueryBasedBuildingSegmenter")
+class QueryBasedBuildingSegmenter(nn.Module):
+    """
+    基于 Pointcept 框架的端到端建筑物实例分割模型 (End-to-End Instance Segmentation)
+    采用 "Semantic-guided + Query-based Decoder" 范式
+    """
+    def __init__(self, ptv3_backbone, hidden_dim=64, num_queries=150, num_decoder_layers=3, nhead=8):
+        super().__init__()
+        
+        # =====================================================================
+        # 1. 动态构建 Backbone (Pointcept 核心逻辑)
+        # =====================================================================
+        # 当从 train.sh 启动时，Pointcept 引擎会把 yaml 里的 ptv3_backbone 作为一个 dict 传进来
+        if isinstance(ptv3_backbone, dict):
+            self.backbone = build_model(ptv3_backbone)
+        else:
+            self.backbone = ptv3_backbone
+
+        self.hidden_dim = hidden_dim
+        self.num_queries = num_queries
+        
+        # =====================================================================
+        # 2. Semantic Head (语义先验提取)
+        # =====================================================================
+        # 输出单通道 Logits，用于判定每个点属于建筑物的前景概率
+        self.semantic_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        
+        # =====================================================================
+        # 3. Instance Query Decoder (实例特征解码器)
+        # =====================================================================
+        # 使用 PyTorch 原生的 Transformer Decoder
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=hidden_dim, 
+            nhead=nhead, 
+            dim_feedforward=hidden_dim * 4, 
+            dropout=0.1, 
+            activation="gelu",
+            batch_first=True # 设定为 [Batch, Seq_len, Feature_dim]
+        )
+        self.instance_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
+        
+        # =====================================================================
+        # 4. Prediction Heads (实例掩码与置信度预测)
+        # =====================================================================
+        # Mask Head：生成 Mask Embeddings，用于和全局 Point Features 做点积
+        self.mask_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        # Class Head：预测该 Query 作为一个真实建筑物实例的置信度 (二分类)
+        self.class_head = nn.Linear(hidden_dim, 1) 
+        
+        # 可学习的 Instance Queries
+        self.query_embed = nn.Embedding(num_queries, hidden_dim)
+
+    def forward(self, data_dict):
+        """
+        前向传播逻辑
+        """
+        # 1. 通过 Backbone 提取高维点特征
+        # point_out 是一个 Point() 对象，包含 .feat, .coord, .offset 等
+        point_out = self.backbone(data_dict) 
+        point_features = point_out.feat # 维度: [N_total, C] (N_total 是整个 Batch 的点数总和)
+        
+        # 2. 计算 Semantic Logits (像素级语义先验)
+        # 维度: [N_total, 1] -> [N_total]
+        semantic_logits = self.semantic_head(point_features).squeeze(-1) 
+        
+        # =====================================================================
+        # 🚀 应对 Pointcept 的无 Batch 维度特性 (Variable-length sequence)
+        # Pointcept 默认把 Batch 内的所有点云拼接成了一个长序列 (N_total)。
+        # 对于 Transformer Decoder，我们需要把它当成 Batch=1，Seq_len=N_total 来处理全局 Cross-Attention。
+        # 如果你的场景极其巨大（比如上百万点），这里可能会吃显存，但 GH200 (100GB) 完全可以硬刚！
+        # =====================================================================
+        
+        # 将 Memory 升维以适配 Transformer: [N_total, C] -> [1, N_total, C]
+        memory = point_features.unsqueeze(0) 
+        
+        # 将 Query 升维以适配 Transformer: [num_queries, C] -> [1, num_queries, C]
+        tgt = self.query_embed.weight.unsqueeze(0) 
+        
+        # 3. 实例特征解码 (Query 与 全局点云特征 交互)
+        # 输出 query_features 维度: [1, num_queries, C]
+        query_features = self.instance_decoder(
+            tgt=tgt, 
+            memory=memory
+        )
+        
+        # 4. 生成预测结果
+        # 计算置信度 (Objectness): [1, num_queries, 1] -> [num_queries]
+        pred_class_logits = self.class_head(query_features).squeeze(0).squeeze(-1)
+        
+        # 计算 Mask Embeddings: [1, num_queries, C]
+        mask_embeds = self.mask_head(query_features)
+        
+        # 💥 核心：通过点积运算 (Dot Product) 得到每个 Query 对每个点的归属概率
+        # mask_embeds [1, num_queries, C] × memory [1, N_total, C] -> [1, num_queries, N_total]
+        pred_mask_logits = torch.einsum("bqc, bnc -> bqn", mask_embeds, memory)
+        
+        # 降维，方便计算 Loss: [num_queries, N_total]
+        pred_mask_logits = pred_mask_logits.squeeze(0)
+
+        # 5. 整理输出结果
+        # 返回一个包含所需信息的字典，供 Pointcept 的 Criterion (Loss函数) 调用
+        ret_dict = {
+            "semantic_logits": semantic_logits,        # 用于计算语义分割的二分类 Loss
+            "pred_class_logits": pred_class_logits,    # 用于计算 Query 是否包含实例的 BCE Loss
+            "pred_mask_logits": pred_mask_logits,      # 用于计算实例掩码的二分图匹配 Loss (Focal + Dice)
+            "coord": point_out.coord,                  # 原始坐标 (如果你的 Loss 需要用到几何距离惩罚)
+            "offset": point_out.offset,                # Pointcept 的 Batch 分界线指示器
+            "batch": point_out.batch                   # 每个点对应的 batch index
+        }
+        
+        return ret_dict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
+from pointcept.models.builder import MODELS
+
+@MODELS.register_module("BuildingInstanceLoss")
+class BuildingInstanceLoss(nn.Module):
+    def __init__(self, building_class_id=2, w_cls=1.0, w_mask=5.0, w_dice=5.0, w_sem=1.0):
+        super().__init__()
+        self.bg_cls_id = building_class_id # UrbanBIS 中建筑物的 label 是 2
+        self.w_cls = w_cls
+        self.w_mask = w_mask
+        self.w_dice = w_dice
+        self.w_sem = w_sem
+
+    def forward(self, pred_dict, target_dict):
+        """
+        pred_dict: 模型输出的字典 (包含 semantic_logits, pred_class_logits, pred_mask_logits)
+        target_dict: DataLoader 提供的数据 (包含 segment, instance)
+        """
+        # 1. 提取 GT 
+        segment = target_dict["segment"]   # [N]
+        instance = target_dict["instance"] # [N]
+        
+        # 2. 提取预测
+        sem_logits = pred_dict["semantic_logits"] # [N]
+        pred_cls = pred_dict["pred_class_logits"] # [num_queries]
+        pred_mask = pred_dict["pred_mask_logits"] # [num_queries, N]
+        
+        # ==========================================
+        # 🌟 Loss 1: 语义先验的二分类 Loss (Semantic)
+        # ==========================================
+        # 生成 0-1 建筑物 Mask (建筑物为 1，其他为 0)
+        gt_building_mask = (segment == self.bg_cls_id).float()
+        loss_sem = F.binary_cross_entropy_with_logits(sem_logits, gt_building_mask)
+
+        # ==========================================
+        # 🌟 匈牙利匹配 (Bipartite Matching)
+        # ==========================================
+        # 找出当前场景中有多少个真实的建筑物实例 (剔除 -1 或 背景)
+        unique_instances = torch.unique(instance)
+        # 假设 instance ID 中，-1 或 0 代表背景，我们需要过滤掉
+        valid_instances = unique_instances[(unique_instances != -1) & (unique_instances != 0)]
+        
+        num_gt = len(valid_instances)
+        num_queries = pred_cls.shape[0]
+        
+        if num_gt == 0:
+            # 如果这块地没有建筑物，所有的 Query 都是错的
+            loss_cls = F.binary_cross_entropy_with_logits(pred_cls, torch.zeros_like(pred_cls))
+            return loss_sem * self.w_sem + loss_cls * self.w_cls
+
+        # 构造 GT Mask 矩阵: [num_gt, N]
+        gt_masks = torch.stack([instance == inst_id for inst_id in valid_instances]).float()
+        
+        with torch.no_grad():
+            # 计算 Cost Matrix
+            # 1. Class Cost: 预测为真实建筑的负概率
+            cost_cls = -torch.sigmoid(pred_cls).unsqueeze(1).repeat(1, num_gt) # [num_queries, num_gt]
+            
+            # 2. Mask Cost (BCE) & Dice Cost
+            # 因为 N 可能很大，这里为了效率，我们可以只算建筑物点上的 cost，或者通过下采样算
+            pred_mask_prob = torch.sigmoid(pred_mask) # [num_queries, N]
+            
+            # (简化的 Cost 计算，实际工程中可优化矩阵运算)
+            cost_mask = F.binary_cross_entropy_with_logits(
+                pred_mask.unsqueeze(1).repeat(1, num_gt, 1), 
+                gt_masks.unsqueeze(0).repeat(num_queries, 1, 1), 
+                reduction='none'
+            ).mean(dim=2) # [num_queries, num_gt]
+            
+            # 综合 Cost
+            C = self.w_cls * cost_cls + self.w_mask * cost_mask
+            C = C.cpu().numpy()
+            
+            # Scipy 匈牙利算法求最优二分图匹配
+            src_idx, tgt_idx = linear_sum_assignment(C)
+
+        # ==========================================
+        # 🌟 计算匹配后的 Loss
+        # ==========================================
+        # Class Loss: 匹配上的 Query target 是 1，没匹配上的是 0
+        target_classes = torch.zeros_like(pred_cls)
+        target_classes[src_idx] = 1.0
+        loss_cls = F.binary_cross_entropy_with_logits(pred_cls, target_classes)
+        
+        # Mask Loss: 只算匹配上的那部分
+        matched_pred_masks = pred_mask[src_idx] # [num_gt, N]
+        matched_gt_masks = gt_masks[tgt_idx]    # [num_gt, N]
+        
+        loss_mask = F.binary_cross_entropy_with_logits(matched_pred_masks, matched_gt_masks)
+        
+        # Dice Loss (平滑版)
+        matched_pred_prob = torch.sigmoid(matched_pred_masks)
+        intersection = (matched_pred_prob * matched_gt_masks).sum(dim=1)
+        union = matched_pred_prob.sum(dim=1) + matched_gt_masks.sum(dim=1)
+        loss_dice = 1.0 - (2. * intersection / (union + 1e-5)).mean()
+
+        # 汇总 Loss
+        total_loss = (self.w_sem * loss_sem + 
+                      self.w_cls * loss_cls + 
+                      self.w_mask * loss_mask + 
+                      self.w_dice * loss_dice)
+                      
+        return total_loss

@@ -14,9 +14,9 @@ from scipy.spatial import cKDTree
 # 🚀 替换为 UrbanBIS 的真实路径
 dataset_root = Path("/lus/lfs1aip2/projects/b6ae/datasets/UrbanBIS").resolve()
 # 针对你截图中的目录结构
-RAW_DATA_ROOT = dataset_root / "raw" / "Lihu"
+RAW_DATA_ROOT = dataset_root / "raw" / "Qingdao"
 # 最终保存的目录
-OUT_DATA_ROOT = dataset_root / "processed_1025D_Pure" 
+OUT_DATA_ROOT = dataset_root / "processed_1025D_Inst" 
 
 WEIGHT_PATH = Path("./weights").resolve()
 DEVICE = "cuda"
@@ -102,7 +102,7 @@ class DINOv3FeatureExtractor:
         return point_level_dino_features
 
 # ========================================================
-# 3. UrbanBIS 专属场景处理函数
+# 3. UrbanBIS 专属场景处理函数 (已支持实例标签提取)
 # ========================================================
 def process_urbanbis_scene(txt_path, extractor):
     txt_path = Path(txt_path)
@@ -125,12 +125,15 @@ def process_urbanbis_scene(txt_path, extractor):
         rgb = df[['r', 'g', 'b']].values.astype(np.uint8)
         sem = df['sem'].values.astype(np.int16)
         
-        # 🚀 极其关键：将 UrbanBIS 特有的 -100 (无标记) 转换为 255 (PyTorch 忽略类)
+        # 🚀 1. 提取实例标签 (使用 int32 防止实例数量过多导致溢出)
+        ins = df['ins1'].values.astype(np.int32)
+        
+        # 将 UrbanBIS 特有的 -100 (无标记) 转换为 255 (PyTorch 忽略类)
         sem[sem == -100] = 255
         
-        # 🚀 检查：打印真实的标签分布，确保 0-6 的有效类都在，且无标记被正确转为 255
         unique_labels = np.unique(sem)
-        print(f"📊 [Debug] 映射后真实存在的标签包含: {unique_labels}")
+        print(f"📊 [Debug] 映射后真实存在的语义标签包含: {unique_labels}")
+        print(f"🏢 [Debug] 当前场景共有 {len(np.unique(ins))} 个独立实例 (Instances)")
         
     except Exception as e:
         print(f"❌ Load Error: {e}")
@@ -140,21 +143,20 @@ def process_urbanbis_scene(txt_path, extractor):
     pts -= pts.min(axis=0)
     grid_coord = np.floor(pts / 0.1).astype(int)
     _, idx = np.unique(grid_coord, axis=0, return_index=True)
-    pts, rgb, sem = pts[idx], rgb[idx], sem[idx]
+    
+    # 🚀 2. 降采样时带上 ins
+    pts, rgb, sem, ins = pts[idx], rgb[idx], sem[idx], ins[idx]
     
     # 2. 计算纯净的 1D 相对高程先验
     print("📏 Computing robust Global Relative Z...")
     z_floor = np.percentile(pts[:, 2], 0.1)
     global_rel_z = (pts[:, 2:3] - z_floor).astype(np.float32)
-    
-    # 🚀 修复 1：高程归一化！防止几百米的绝对高程梯度爆炸
     global_rel_z = np.clip(global_rel_z / 100.0, 0.0, 1.0)
     
     # 3. 空间切块并提取 DINO 
     x_max, y_max = pts.max(axis=0)[:2]
     chunk_count = 0
     
-    # 🚀 修复 2：动态步长。Train 重叠增强 (25m)，Test/Val 无缝拼接 (50m) 防止泄露和重复计算
     stride = 25 if split == "train" else 50
     
     print(f"✂️ Chunking (Stride: {stride}m) & Extracting DINOv3 1024D...")
@@ -165,7 +167,6 @@ def process_urbanbis_scene(txt_path, extractor):
             
             chunk_folder = save_dir / f"{scene_name}_{chunk_count}"
             
-            # 断点续传保护
             if (chunk_folder / "extra_feat.npy").exists():
                 chunk_count += 1
                 continue
@@ -175,6 +176,10 @@ def process_urbanbis_scene(txt_path, extractor):
             pts_chunk = pts[mask]
             rgb_chunk = rgb[mask]
             sem_chunk = sem[mask]
+            
+            # 🚀 3. 切块时带上实例标签
+            ins_chunk = ins[mask]
+            
             rel_z_chunk = global_rel_z[mask]
             
             # 模拟 voxel_down_sample(0.5m) 用于 DINO 提特征
@@ -194,7 +199,6 @@ def process_urbanbis_scene(txt_path, extractor):
             _, indices = kdtree.query(pts_chunk, k=1, workers=-1)
             full_res_dino = down_features[indices].numpy()
             
-            # 🚀 组合终极 1025D Extra Feature [Rel_Z, DINO]
             extra_feat = np.concatenate([rel_z_chunk, full_res_dino], axis=1).astype(np.float32)
             
             # 保存数据
@@ -203,10 +207,12 @@ def process_urbanbis_scene(txt_path, extractor):
             np.save(chunk_folder / "segment.npy", sem_chunk)
             np.save(chunk_folder / "extra_feat.npy", extra_feat)
             
+            # 🚀 4. 将 instance 数组保存为独立的 npy 文件
+            np.save(chunk_folder / "instance.npy", ins_chunk)
+            
             chunk_count += 1
 
     print(f"✅ {scene_name} processed: {chunk_count} chunks generated.")
-
 # ========================================================
 # 4. 主程序入口
 # ========================================================
