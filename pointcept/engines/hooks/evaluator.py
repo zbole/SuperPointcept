@@ -642,3 +642,157 @@ class InsSegEvaluator(HookBase):
             )
             self.trainer.comm_info["current_metric_value"] = all_ap_50  # save for saver
             self.trainer.comm_info["current_metric_name"] = "AP50"  # save for saver
+
+
+import torch
+from pointcept.engines.hooks.builder import HOOKS
+from pointcept.engines.hooks.default import HookBase
+
+import torch
+import numpy as np
+from pointcept.engines.hooks.builder import HOOKS
+from pointcept.engines.hooks.default import HookBase
+
+@HOOKS.register_module("InstanceSegEvaluator")
+class InstanceSegEvaluator(HookBase):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.best_metric = 0.0
+        self.building_class_id = 2  # UrbanBIS 中建筑的类别ID
+        self.conf_thresh = 0.5      # Query 置信度阈值
+        self.mask_thresh = 0.5      # Mask 逐像素二分类阈值
+
+    def calculate_ap50(self, pred_masks, pred_scores, gt_masks):
+        """
+        计算单个场景的 Instance AP@0.5 (Average Precision)
+        pred_masks: [num_preds, N] (boolean)
+        pred_scores: [num_preds]
+        gt_masks: [num_gts, N] (boolean)
+        """
+        num_gt = gt_masks.shape[0]
+        num_pred = pred_scores.shape[0]
+        
+        if num_gt == 0 and num_pred == 0: return 1.0
+        if num_gt == 0 or num_pred == 0: return 0.0
+
+        # 1. 按照预测置信度降序排列
+        sort_idx = torch.argsort(pred_scores, descending=True)
+        pred_masks = pred_masks[sort_idx]
+        pred_scores = pred_scores[sort_idx]
+
+        # 2. 计算预测 Mask 和 GT Mask 之间的 IoU 矩阵: [num_pred, num_gt]
+        intersection = (pred_masks.unsqueeze(1) & gt_masks.unsqueeze(0)).sum(dim=2).float()
+        union = (pred_masks.unsqueeze(1) | gt_masks.unsqueeze(0)).sum(dim=2).float()
+        iou_matrix = intersection / (union + 1e-5)
+        iou_matrix = iou_matrix.cpu().numpy()
+
+        # 3. 贪心匹配 (Greedy Matching)
+        tp = np.zeros(num_pred)
+        fp = np.zeros(num_pred)
+        gt_matched = np.zeros(num_gt)
+
+        for p_idx in range(num_pred):
+            best_iou = 0
+            best_gt_idx = -1
+            for g_idx in range(num_gt):
+                if iou_matrix[p_idx, g_idx] > best_iou:
+                    best_iou = iou_matrix[p_idx, g_idx]
+                    best_gt_idx = g_idx
+
+            # 阈值设为 0.5，且该 GT 还没被认领过，记为 True Positive
+            if best_iou >= 0.5 and gt_matched[best_gt_idx] == 0:
+                tp[p_idx] = 1
+                gt_matched[best_gt_idx] = 1
+            else:
+                fp[p_idx] = 1
+
+        # 4. 计算 P-R 曲线和 AP (VOC 11-point 算法)
+        tp_cumsum = np.cumsum(tp)
+        fp_cumsum = np.cumsum(fp)
+        recalls = tp_cumsum / num_gt
+        precisions = tp_cumsum / (tp_cumsum + fp_cumsum + 1e-5)
+
+        ap = 0.0
+        for t in np.arange(0, 1.1, 0.1):
+            if np.sum(recalls >= t) == 0:
+                p = 0
+            else:
+                p = np.max(precisions[recalls >= t])
+            ap += p / 11.0
+            
+        return ap
+
+    def after_epoch(self, trainer):
+        # 只有在到达 eval_epoch 设定的倍数时才评估
+        if (trainer.epoch + 1) % trainer.cfg.eval_epoch != 0:
+            return
+
+        trainer.logger.info(">>>>>>>>>>>>>>>> Start Validation >>>>>>>>>>>>>>>>")
+        trainer.model.eval() 
+        
+        total_sem_iou = 0.0
+        total_ap50 = 0.0
+        valid_batches = 0
+        
+        with torch.no_grad():
+            for i, data_dict in enumerate(trainer.val_loader):
+                for key in data_dict.keys():
+                    if isinstance(data_dict[key], torch.Tensor):
+                        data_dict[key] = data_dict[key].cuda(non_blocking=True)
+                
+                # 模型前向传播
+                ret_dict = trainer.model(data_dict)
+                
+                # 提取预测张量并通过 Sigmoid 转换为 0~1 的概率
+                pred_cls_probs = torch.sigmoid(ret_dict["pred_class_logits"]) # [num_queries]
+                pred_mask_probs = torch.sigmoid(ret_dict["pred_mask_logits"]) # [num_queries, N]
+                
+                gt_seg = data_dict["segment"]   # [N]
+                gt_inst = data_dict["instance"] # [N]
+                
+                # ====================================================
+                # 指标 1：计算 Semantic IoU (仅建筑物类)
+                # ====================================================
+                # 将所有 Query 预测的前景叠在一起，构成全局的建筑物 Semantic Mask
+                pred_sem_mask = (pred_mask_probs > self.mask_thresh).any(dim=0)
+                gt_sem_mask = (gt_seg == self.building_class_id)
+                
+                intersection = (pred_sem_mask & gt_sem_mask).sum().float()
+                union = (pred_sem_mask | gt_sem_mask).sum().float()
+                sem_iou = (intersection / (union + 1e-5)).item()
+                total_sem_iou += sem_iou
+                
+                # ====================================================
+                # 指标 2：计算 Instance AP@0.5 (实例平均精度)
+                # ====================================================
+                # 过滤掉低置信度的“死” Query
+                keep = pred_cls_probs > self.conf_thresh
+                valid_pred_scores = pred_cls_probs[keep]
+                valid_pred_masks = pred_mask_probs[keep] > self.mask_thresh
+                
+                # 提取真实存在的 GT Instances
+                unique_insts = torch.unique(gt_inst)
+                valid_gt_insts = unique_insts[(unique_insts != -1) & (unique_insts != 0)]
+                gt_masks = torch.stack([gt_inst == inst_id for inst_id in valid_gt_insts]) if len(valid_gt_insts) > 0 else torch.empty((0, gt_inst.shape[0]), device=gt_inst.device, dtype=torch.bool)
+                
+                ap50 = self.calculate_ap50(valid_pred_masks, valid_pred_scores, gt_masks)
+                total_ap50 += ap50
+                
+                valid_batches += 1
+
+        # 汇总并打印结果
+        avg_sem_iou = total_sem_iou / valid_batches
+        avg_ap50 = total_ap50 / valid_batches
+        
+        trainer.logger.info(f"📊 Validation Results [Epoch {trainer.epoch + 1}]:")
+        trainer.logger.info(f"   - Semantic Building IoU : {avg_sem_iou:.4f}")
+        trainer.logger.info(f"   - Instance AP@0.5       : {avg_ap50:.4f}")
+        
+        # 自动保存在 Val 上 AP 最高的模型
+        if avg_ap50 > self.best_metric:
+            self.best_metric = avg_ap50
+            trainer.best_metric = self.best_metric # 更新底层引擎，触发 CheckpointSaver
+            trainer.logger.info(f"🎉 New Best Model Saved! Val AP50: {self.best_metric:.4f}")
+            
+        trainer.model.train()
+        trainer.logger.info("<<<<<<<<<<<<<<<< End Validation <<<<<<<<<<<<<<<<")

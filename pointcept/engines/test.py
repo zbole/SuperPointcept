@@ -1322,3 +1322,18 @@ class InsSegTester(TesterBase):
     def collate_fn(batch):
         # Restrict to bs 1
         return batch[0]
+
+
+from pointcept.engines.test.builder import TESTERS
+
+@TESTERS.register_module("InstanceSegTester")
+class InstanceSegTester:
+    def __init__(self, **kwargs):
+        self.cfg = kwargs.get('cfg', None)
+        self.logger = get_root_logger()
+
+    def test(self): # 🚀 修改为 test()
+        self.logger.info(">>>>>>>>>>>>>>>> Instance Testing process skipped <<<<<<<<<<<<<<<<")
+        self.logger.info("Please use the custom inference script to decode Query-based 3D masks.")
+        # 如果需要彻底绕过，直接 return 即可
+        return

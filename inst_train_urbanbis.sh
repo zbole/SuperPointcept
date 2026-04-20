@@ -30,7 +30,7 @@ export TMPDIR=/dev/shm/tmp_${SLURM_JOB_ID}
 mkdir -p $TMPDIR
 
 CONFIG_NAME="semseg-pt-v3m1-0-base" 
-EXP_NAME="UrbanBIS_INST"
+EXP_NAME="UrbanBIS_INST2"
 
 echo "=========================================================="
 echo "🚀 Starting Job $SLURM_JOB_ID on $(hostname)"

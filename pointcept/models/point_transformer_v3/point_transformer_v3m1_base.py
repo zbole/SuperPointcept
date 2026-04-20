@@ -234,7 +234,7 @@ class SerializedAttention(PointModule):
                 m = m.reshape(-1, H, C // H)
                 q, k, v = qkv.unbind(dim=1) 
                 q = q * m 
-                qkv = torch.stack([q, k, v], dim=1) 
+                qkv = torch.stack([q, k, v], dim=1).contiguous()
 
             feat = flash_attn.flash_attn_varlen_qkvpacked_func(
                 qkv.to(torch.bfloat16),
@@ -854,17 +854,10 @@ from pointcept.models.builder import MODELS, build_model
 
 @MODELS.register_module("QueryBasedBuildingSegmenter")
 class QueryBasedBuildingSegmenter(nn.Module):
-    """
-    基于 Pointcept 框架的端到端建筑物实例分割模型 (End-to-End Instance Segmentation)
-    采用 "Semantic-guided + Query-based Decoder" 范式
-    """
-    def __init__(self, ptv3_backbone, hidden_dim=64, num_queries=150, num_decoder_layers=3, nhead=8):
+    # 🚀 1. 在参数列表里加上 criteria=None
+    def __init__(self, ptv3_backbone, hidden_dim=64, num_queries=150, num_decoder_layers=3, nhead=8, criteria=None):
         super().__init__()
         
-        # =====================================================================
-        # 1. 动态构建 Backbone (Pointcept 核心逻辑)
-        # =====================================================================
-        # 当从 train.sh 启动时，Pointcept 引擎会把 yaml 里的 ptv3_backbone 作为一个 dict 传进来
         if isinstance(ptv3_backbone, dict):
             self.backbone = build_model(ptv3_backbone)
         else:
@@ -873,10 +866,6 @@ class QueryBasedBuildingSegmenter(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_queries = num_queries
         
-        # =====================================================================
-        # 2. Semantic Head (语义先验提取)
-        # =====================================================================
-        # 输出单通道 Logits，用于判定每个点属于建筑物的前景概率
         self.semantic_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
@@ -884,95 +873,69 @@ class QueryBasedBuildingSegmenter(nn.Module):
             nn.Linear(hidden_dim // 2, 1)
         )
         
-        # =====================================================================
-        # 3. Instance Query Decoder (实例特征解码器)
-        # =====================================================================
-        # 使用 PyTorch 原生的 Transformer Decoder
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=hidden_dim, 
             nhead=nhead, 
             dim_feedforward=hidden_dim * 4, 
             dropout=0.1, 
             activation="gelu",
-            batch_first=True # 设定为 [Batch, Seq_len, Feature_dim]
+            batch_first=True
         )
         self.instance_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
         
-        # =====================================================================
-        # 4. Prediction Heads (实例掩码与置信度预测)
-        # =====================================================================
-        # Mask Head：生成 Mask Embeddings，用于和全局 Point Features 做点积
         self.mask_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
-        # Class Head：预测该 Query 作为一个真实建筑物实例的置信度 (二分类)
         self.class_head = nn.Linear(hidden_dim, 1) 
-        
-        # 可学习的 Instance Queries
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
 
+        # 🚀 2. 解析并构建 Loss 函数
+        if criteria is not None:
+            # Pointcept 里的 criteria 通常是一个 list
+            if isinstance(criteria, list):
+                self.criteria = build_model(criteria[0])
+            else:
+                self.criteria = build_model(criteria)
+        else:
+            self.criteria = None
+
     def forward(self, data_dict):
-        """
-        前向传播逻辑
-        """
-        # 1. 通过 Backbone 提取高维点特征
-        # point_out 是一个 Point() 对象，包含 .feat, .coord, .offset 等
         point_out = self.backbone(data_dict) 
-        point_features = point_out.feat # 维度: [N_total, C] (N_total 是整个 Batch 的点数总和)
+        point_features = point_out.feat 
         
-        # 2. 计算 Semantic Logits (像素级语义先验)
-        # 维度: [N_total, 1] -> [N_total]
         semantic_logits = self.semantic_head(point_features).squeeze(-1) 
         
-        # =====================================================================
-        # 🚀 应对 Pointcept 的无 Batch 维度特性 (Variable-length sequence)
-        # Pointcept 默认把 Batch 内的所有点云拼接成了一个长序列 (N_total)。
-        # 对于 Transformer Decoder，我们需要把它当成 Batch=1，Seq_len=N_total 来处理全局 Cross-Attention。
-        # 如果你的场景极其巨大（比如上百万点），这里可能会吃显存，但 GH200 (100GB) 完全可以硬刚！
-        # =====================================================================
-        
-        # 将 Memory 升维以适配 Transformer: [N_total, C] -> [1, N_total, C]
         memory = point_features.unsqueeze(0) 
-        
-        # 将 Query 升维以适配 Transformer: [num_queries, C] -> [1, num_queries, C]
         tgt = self.query_embed.weight.unsqueeze(0) 
         
-        # 3. 实例特征解码 (Query 与 全局点云特征 交互)
-        # 输出 query_features 维度: [1, num_queries, C]
-        query_features = self.instance_decoder(
-            tgt=tgt, 
-            memory=memory
-        )
+        query_features = self.instance_decoder(tgt=tgt, memory=memory)
         
-        # 4. 生成预测结果
-        # 计算置信度 (Objectness): [1, num_queries, 1] -> [num_queries]
         pred_class_logits = self.class_head(query_features).squeeze(0).squeeze(-1)
-        
-        # 计算 Mask Embeddings: [1, num_queries, C]
         mask_embeds = self.mask_head(query_features)
         
-        # 💥 核心：通过点积运算 (Dot Product) 得到每个 Query 对每个点的归属概率
-        # mask_embeds [1, num_queries, C] × memory [1, N_total, C] -> [1, num_queries, N_total]
         pred_mask_logits = torch.einsum("bqc, bnc -> bqn", mask_embeds, memory)
-        
-        # 降维，方便计算 Loss: [num_queries, N_total]
         pred_mask_logits = pred_mask_logits.squeeze(0)
 
-        # 5. 整理输出结果
-        # 返回一个包含所需信息的字典，供 Pointcept 的 Criterion (Loss函数) 调用
         ret_dict = {
-            "semantic_logits": semantic_logits,        # 用于计算语义分割的二分类 Loss
-            "pred_class_logits": pred_class_logits,    # 用于计算 Query 是否包含实例的 BCE Loss
-            "pred_mask_logits": pred_mask_logits,      # 用于计算实例掩码的二分图匹配 Loss (Focal + Dice)
-            "coord": point_out.coord,                  # 原始坐标 (如果你的 Loss 需要用到几何距离惩罚)
-            "offset": point_out.offset,                # Pointcept 的 Batch 分界线指示器
-            "batch": point_out.batch                   # 每个点对应的 batch index
+            "semantic_logits": semantic_logits,       
+            "pred_class_logits": pred_class_logits,    
+            "pred_mask_logits": pred_mask_logits,      
+            "coord": point_out.coord,                  
+            "offset": point_out.offset,                
+            "batch": point_out.batch                   
         }
         
-        return ret_dict
+        # 🚀 3. 根据所处模式，返回不同的结果供 Pointcept 引擎使用
+        if self.training and self.criteria is not None:
+            # 训练阶段：必须返回 loss 字典，且必须包含 key 为 "loss" 的项
+            loss = self.criteria(ret_dict, data_dict)
+            return {"loss": loss}
+        else:
+            # 验证/测试阶段：返回空字典或默认字典，避免 Evaluator 去读不存在的 keys
+            return {"seg_logits": torch.zeros((1, 1), device=data_dict['coord'].device)}
 
 import torch
 import torch.nn as nn
@@ -1040,11 +1003,16 @@ class BuildingInstanceLoss(nn.Module):
             pred_mask_prob = torch.sigmoid(pred_mask) # [num_queries, N]
             
             # (简化的 Cost 计算，实际工程中可优化矩阵运算)
+            # 优化后的代码 (利用 Broadcast)
+            pred_mask_expanded = pred_mask.unsqueeze(1)  # [num_queries, 1, N]
+            gt_masks_expanded = gt_masks.unsqueeze(0)    # [1, num_gt, N]
+
+            # BCE loss 原生支持 broadcast
             cost_mask = F.binary_cross_entropy_with_logits(
-                pred_mask.unsqueeze(1).repeat(1, num_gt, 1), 
-                gt_masks.unsqueeze(0).repeat(num_queries, 1, 1), 
+                pred_mask_expanded.expand(-1, num_gt, -1), 
+                gt_masks_expanded.expand(num_queries, -1, -1), 
                 reduction='none'
-            ).mean(dim=2) # [num_queries, num_gt]
+            ).mean(dim=2)
             
             # 综合 Cost
             C = self.w_cls * cost_cls + self.w_mask * cost_mask
