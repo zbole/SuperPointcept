@@ -3,7 +3,7 @@ resume = False
 evaluate = True
 test_only = False
 seed = 2026
-save_path = 'exp/sensaturban/SensatUrban_DSGG-PT_FinalEXP'
+save_path = 'yourpath'
 num_worker = 16
 batch_size = 8
 gradient_accumulation_steps = 1
@@ -73,10 +73,7 @@ model = dict(
         dict(
             type='CrossEntropyLoss',
             loss_weight=1.0,
-            ignore_index=255,
-            weight=[
-                0.2, 0.2, 0.2, 0.6, 1.5, 1.8, 2.5, 0.5, 1.2, 0.6, 2.0, 3.0, 1.0
-            ]),
+            ignore_index=255,),
         dict(
             type='LovaszLoss',
             mode='multiclass',
@@ -92,7 +89,7 @@ scheduler = dict(
     div_factor=10.0,
     final_div_factor=1000.0)
 dataset_type = 'DefaultDataset'
-data_root = '/datasets/sensaturban/processed_1025D_SP-PT/'
+data_root = 'yourpath'
 data = dict(
     num_classes=13,
     ignore_index=255,
@@ -153,7 +150,7 @@ data = dict(
         loop=5),
     val=dict(
         type='DefaultDataset',
-        split='test',
+        split='val',
         data_root=data_root,
         transform=[
             dict(type='CenterShift', apply_z=True),
@@ -191,19 +188,17 @@ data = dict(
                 grid_size=0.1,
                 hash_type='fnv',
                 mode='test',
-                return_grid_coord=True), # 🚀 删除了 keys 参数，保持原生结构
+                return_grid_coord=True),
             crop=None,
             post_transform=[
                 dict(type='CenterShift', apply_z=True),
                 dict(type='ToTensor'),
                 dict(
                     type='Collect',
-                    # 🚀 只改这一行：把 'index' 加回来！
                     keys=('coord', 'grid_coord', 'index'), 
                     feat_keys=('coord', 'color', 'extra_feat'))
             ],
             aug_transform = [
-            # Angle 1: 0度 (Baseline)
             [{
                 'type': 'RandomRotateTargetAngle',
                 'angle': [0],
@@ -211,22 +206,6 @@ data = dict(
                 'center': [0, 0, 0],
                 'p': 1
             }],
-            # Angle 2: 120度 (2/3 Pi)
-            [{
-                'type': 'RandomRotateTargetAngle',
-                'angle': [np.pi * 2 / 3], 
-                'axis': 'z',
-                'center': [0, 0, 0],
-                'p': 1
-            }],
-            # Angle 3: 240度 (4/3 Pi)
-            [{
-                'type': 'RandomRotateTargetAngle',
-                'angle': [np.pi * 4 / 3],
-                'axis': 'z',
-                'center': [0, 0, 0],
-                'p': 1
-            }]
         ]
         )
     ),

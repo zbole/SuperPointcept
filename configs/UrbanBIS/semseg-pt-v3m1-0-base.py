@@ -1,9 +1,8 @@
-weight = 'exp/UrbanBIS/UrbanBIS_DSGG-PT_Exp/model/model_best.pth'
 resume = False
 evaluate = True
 test_only = False
 seed = 20262026
-save_path = 'exp/UrbanBIS/UrbanBIS_DSGG-PT_Exp'
+save_path = "yourpath"
 num_worker = 16
 batch_size = 16
 gradient_accumulation_steps = 1
@@ -68,7 +67,7 @@ model = dict(
         pdnorm_decouple=True,
         pdnorm_adaptive=False,
         pdnorm_affine=True,
-        pdnorm_conditions=('ScanNet', 'S3DIS', 'Structured3D', 'UrbanBIS')), # 🚀 修改点 2：添加 UrbanBIS 条件
+        pdnorm_conditions=('ScanNet', 'S3DIS', 'Structured3D', 'UrbanBIS')),
     criteria=[
         dict(
             type='CrossEntropyLoss',
@@ -93,9 +92,9 @@ scheduler = dict(
 dataset_type = 'DefaultDataset'
 data_root = '/datasets/UrbanBIS/processed_1025D_Pure/'
 data = dict(
-    num_classes=7, # 🚀 修改点 4：类别数改为 7
+    num_classes=7,
     ignore_index=255,
-    names=[ # 🚀 修改点 5：更新类别名称列表
+    names=[
         'Terrain', 'Vegetation', 'Water', 'Bridge', 'Vehicle', 'Boat', 'Building'
     ],
     train=dict(
@@ -150,7 +149,7 @@ data = dict(
         loop=5),
     val=dict(
         type='DefaultDataset',
-        split='test',
+        split='val',
         data_root=data_root,
         transform=[
             dict(type='CenterShift', apply_z=True),

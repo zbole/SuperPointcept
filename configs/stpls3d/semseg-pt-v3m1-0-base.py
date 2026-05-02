@@ -90,7 +90,7 @@ scheduler = dict(
     div_factor=10.0,
     final_div_factor=1000.0)
 dataset_type = 'DefaultDataset'
-data_root = '/datasets/STPLS3D/WMSC_Hybrid_Dataset/' 
+data_root = 'yourpath'
 data = dict(
     num_classes=18,
     ignore_index=255,
@@ -152,7 +152,7 @@ data = dict(
         loop=1),
     val=dict(
         type='DefaultDataset',
-        split='test',
+        split='val',
         data_root=data_root,
         transform=[
             dict(type='CenterShift', apply_z=True),
@@ -177,7 +177,7 @@ data = dict(
     
     test=dict(
         type='DefaultDataset',
-        split='test', # 🎯 修正：将 val 恢复为 test
+        split='test',
         data_root=data_root,
         transform=[
             dict(type='CenterShift', apply_z=True),
@@ -201,23 +201,7 @@ data = dict(
                     feat_keys=('coord', 'color', 'extra_feat'))
             ],
             aug_transform=[
-                # 1. Base: 原始视角 (0°)
                 [dict(type='RandomRotateTargetAngle', angle=[0], axis='z', center=[0, 0, 0], p=1)],
-                
-                # 2. Rotation: Z轴旋转 90° (Pointcept 里 angle 是乘了 pi 的，1/2 代表 90°)
-                [dict(type='RandomRotateTargetAngle', angle=[1/2], axis='z', center=[0, 0, 0], p=1)],
-                
-                # 3. Rotation: Z轴旋转 180°
-                [dict(type='RandomRotateTargetAngle', angle=[1], axis='z', center=[0, 0, 0], p=1)],
-                
-                # 4. Rotation: Z轴旋转 270°
-                [dict(type='RandomRotateTargetAngle', angle=[3/2], axis='z', center=[0, 0, 0], p=1)],
-
-                [dict(type='RandomScale', scale=[0.95, 0.95])],
-                [dict(type='RandomScale', scale=[1.05, 1.05])],
-                
-                # 6. Flip: 轴向镜像 (提升道路和建筑边界的鲁棒性)
-                [dict(type='RandomFlip', p=1.0)], 
             ]
         )
     ),
